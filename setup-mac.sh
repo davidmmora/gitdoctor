@@ -7,16 +7,34 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PARENT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-GRANDPARENT_DIR="$(cd "$PARENT_DIR/.." && pwd)"
-
 PARENT_NAME="$(basename "$PARENT_DIR")"
-GRANDPARENT_NAME="$(basename "$GRANDPARENT_DIR" | tr '[:upper:]' '[:lower:]')"
 
-# Si GitDoctor reside en Personal/gitdoctor u otra organizacion oficial, REPOS_DIR es el abuelo
-if [[ "$PARENT_NAME" =~ ^(Personal|th-mex|w-amarillo|w-azul|w-naranja|interpec|w-pluma|w-ic|bf-agency|WeHubs-io)$ ]] || [[ "$GRANDPARENT_NAME" =~ ^(repos|proyectos|developer)$ ]]; then
-    REPOS_DIR="$GRANDPARENT_DIR"
+# REGLA ESTRICTA: GitDoctor reside UNICAMENTE en la raiz de repositorios
+if [[ "$PARENT_NAME" =~ ^(Personal|th-mex|w-amarillo|w-azul|w-naranja|interpec|w-pluma|w-ic|bf-agency|WeHubs-io)$ ]]; then
+    echo -e "\033[31m[ERROR] GitDoctor reside dentro de la organizacion '$PARENT_NAME'.\033[0m"
+    echo -e "\033[33m[REGLA ESTRICTA] GitDoctor debe estar UNICAMENTE en la raiz de tu carpeta de repositorios (ej: ~/Repos/gitdoctor, ~/Developer/gitdoctor o tu carpeta base).\033[0m"
+    echo -e "\033[33mMueve la carpeta 'gitdoctor' a la raiz de tu directorio principal de proyectos para evitar conflictos.\033[0m"
+    exit 1
+fi
+
+REPOS_DIR="$PARENT_DIR"
+
+# Registrar la carpeta raiz en config.local.json si no fue personalizada antes
+LOCAL_CFG="$SCRIPT_DIR/config.local.json"
+if [ ! -f "$LOCAL_CFG" ]; then
+    echo "{\"repos_dir\": \"$REPOS_DIR\", \"sync_mode\": \"mirror\", \"enabled_orgs\": [], \"disabled_orgs\": []}" > "$LOCAL_CFG"
 else
-    REPOS_DIR="$PARENT_DIR"
+    python3 -c "
+import json
+path = '$LOCAL_CFG'
+try:
+    d = json.load(open(path))
+    if not d.get('repos_dir'):
+        d['repos_dir'] = '$REPOS_DIR'
+        json.dump(d, open(path, 'w'), indent=4, ensure_ascii=False)
+except Exception:
+    pass
+" 2>/dev/null || true
 fi
 
 REAJUSTE_MODE=false
@@ -29,12 +47,15 @@ C_CYAN="\033[36m"
 C_GREEN="\033[32m"
 C_YELLOW="\033[33m"
 C_WHITE="\033[1;37m"
+C_GRAY="\033[90m"
 
 if [ "$REAJUSTE_MODE" = false ]; then
     echo ""
     echo -e "${C_CYAN}==========================================================${C_RESET}"
     echo -e "${C_CYAN}  GitDoctor -- Instalador de Suite de Salud y Git (macOS)${C_RESET}"
     echo -e "${C_CYAN}==========================================================${C_RESET}"
+    echo -e "${C_GRAY}  Carpeta raiz de proyectos: ${C_WHITE}$REPOS_DIR${C_RESET}"
+    echo -e "${C_GRAY}  Ubicacion de GitDoctor:    ${C_WHITE}$SCRIPT_DIR${C_RESET}"
     echo ""
 fi
 
@@ -56,6 +77,7 @@ if [ "$REAJUSTE_MODE" = false ]; then
         GH_USER=$(gh api user --jq .login 2>/dev/null || true)
         if [ -n "$GH_USER" ]; then
             echo -e "      ${C_GREEN}[OK] GitHub CLI conectado como @$GH_USER${C_RESET}"
+            echo -e "      ${C_GRAY}     Boveda Privada disponible: Usa 'gitdoctor /catalogo' para sincronizar tu inventario.${C_RESET}"
         else
             echo -e "      ${C_YELLOW}[INFO] GitHub CLI detectado sin sesion. Usa 'reposync-ai' o 'gh auth login' para iniciar sesion.${C_RESET}"
         fi
@@ -86,22 +108,26 @@ for legacy in "_sync" "repos-sync"; do
     fi
 done
 
-# Limpiar clones duplicados o redundantes de GitDoctor en otras carpetas
-for dup in "$REPOS_DIR/_gitdoctor" "$REPOS_DIR/gitdoctor" "$REPOS_DIR/Personal/gitdoctor" "$REPOS_DIR/Personal/repos-sync"; do
-    if [ -d "$dup" ]; then
-        DUP_CANONICAL="$(cd "$dup" 2>/dev/null && pwd || true)"
-        if [ -n "$DUP_CANONICAL" ] && [ "$DUP_CANONICAL" != "$SCRIPT_DIR" ]; then
-            if [ -f "$dup/agent.py" ]; then
-                rm -rf "$dup" 2>/dev/null || true
-            fi
-        fi
+# Limpiar clones duplicados o mal ubicados de GitDoctor en organizaciones o carpetas legacy
+for org in "Personal" "th-mex" "w-amarillo" "w-azul" "w-naranja" "interpec" "w-pluma" "w-ic" "bf-agency" "WeHubs-io"; do
+    if [ -d "$REPOS_DIR/$org/gitdoctor" ] && [ "$(cd "$REPOS_DIR/$org/gitdoctor" 2>/dev/null && pwd)" != "$SCRIPT_DIR" ]; then
+        rm -rf "$REPOS_DIR/$org/gitdoctor" 2>/dev/null || true
+    fi
+    if [ -d "$REPOS_DIR/$org/repos-sync" ] && [ "$(cd "$REPOS_DIR/$org/repos-sync" 2>/dev/null && pwd)" != "$SCRIPT_DIR" ]; then
+        rm -rf "$REPOS_DIR/$org/repos-sync" 2>/dev/null || true
+    fi
+done
+
+for legacy in "$REPOS_DIR/_gitdoctor" "$REPOS_DIR/_sync" "$REPOS_DIR/repos-sync"; do
+    if [ -d "$legacy" ] && [ "$(cd "$legacy" 2>/dev/null && pwd)" != "$SCRIPT_DIR" ]; then
+        rm -rf "$legacy" 2>/dev/null || true
     fi
 done
 
 SHELL_BLOCK="# >>> GitDoctor Global Commands >>>
 gitdoctor() {
     local target=\"\"
-    for d in \"$SCRIPT_DIR\" \"\$HOME/Repos/Personal/gitdoctor\" \"\$HOME/repos/Personal/gitdoctor\" \"\$HOME/Repos/_gitdoctor\" \"\$HOME/repos/_gitdoctor\" \"\$HOME/Repos/gitdoctor\" \"\$HOME/repos/gitdoctor\" \"\$HOME/Repos/_sync\" \"\$HOME/repos/_sync\" \"\$HOME/Repos/repos-sync\" \"\$HOME/repos/repos-sync\"; do
+    for d in \"$SCRIPT_DIR\" \"\$HOME/Repos/gitdoctor\" \"\$HOME/repos/gitdoctor\"; do
         if [ -f \"\$d/agent.py\" ]; then target=\"\$d\"; break; fi
     done
     if [ -n \"\$target\" ]; then
@@ -112,7 +138,7 @@ gitdoctor() {
             python3 \"\$target/agent.py\" \"\$@\"
         fi
     else
-        echo \"[ERROR] No se encontro agent.py en las rutas conocidas de GitDoctor.\"
+        echo \"[ERROR] No se encontro agent.py en las rutas conocidas de GitDoctor (~/Repos/gitdoctor).\"
         return 1
     fi
 }

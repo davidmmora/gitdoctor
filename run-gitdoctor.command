@@ -2,7 +2,7 @@
 # GitDoctor AI - Suite Clinica de Salud de Repositorios (macOS Launcher)
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ ! -f "$DIR/agent.py" ]; then
-    for cand in "$HOME/Repos/_sync" "$HOME/repos/_sync" "$HOME/Repos/repos-sync"; do
+    for cand in "$HOME/Repos/gitdoctor" "$HOME/repos/gitdoctor"; do
         if [ -f "$cand/agent.py" ]; then
             DIR="$cand"
             break

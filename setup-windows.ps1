@@ -12,16 +12,32 @@ if (-not $scriptDir) { $scriptDir = (Get-Location).Path }
 $syncScript = Join-Path $scriptDir "sync.ps1"
 
 $parentDir = Split-Path -Parent $scriptDir
-$grandparentDir = Split-Path -Parent $parentDir
 $parentName = Split-Path -Leaf $parentDir
-$grandparentName = ""
-if ($grandparentDir) { $grandparentName = (Split-Path -Leaf $grandparentDir).ToLower() }
 
 $knownOrgs = @("Personal", "th-mex", "w-amarillo", "w-azul", "w-naranja", "interpec", "w-pluma", "w-ic", "bf-agency", "WeHubs-io")
-if ($knownOrgs -contains $parentName -or $grandparentName -in @("repos", "proyectos", "developer")) {
-    $reposDir = $grandparentDir
+
+# REGLA ESTRICTA: GitDoctor reside UNICAMENTE en la raiz de repositorios
+if ($knownOrgs -contains $parentName) {
+    Write-Host "[ERROR] GitDoctor reside dentro de la organizacion '$parentName'." -ForegroundColor Red
+    Write-Host "[REGLA ESTRICTA] GitDoctor debe estar UNICAMENTE en la raiz de tu carpeta de repositorios (ej: D:\Repos\gitdoctor, C:\Proyectos\gitdoctor o la unidad/carpeta que elijas)." -ForegroundColor Yellow
+    Write-Host "Mueve la carpeta 'gitdoctor' a la raiz de tu directorio principal de proyectos para evitar conflictos." -ForegroundColor Yellow
+    exit 1
+}
+
+$reposDir = $parentDir
+
+# Registrar la carpeta raiz en config.local.json si no fue personalizada antes
+$localCfgPath = Join-Path $scriptDir "config.local.json"
+if (-not (Test-Path $localCfgPath)) {
+    @{ repos_dir = $reposDir; sync_mode = "mirror"; enabled_orgs = @(); disabled_orgs = @() } | ConvertTo-Json -Depth 4 | Out-File -FilePath $localCfgPath -Encoding utf8
 } else {
-    $reposDir = $parentDir
+    try {
+        $cfg = Get-Content $localCfgPath -Raw -Encoding utf8 | ConvertFrom-Json
+        if (-not $cfg.repos_dir) {
+            $cfg | Add-Member -MemberType NoteProperty -Name "repos_dir" -Value $reposDir -Force
+            $cfg | ConvertTo-Json -Depth 4 | Out-File -FilePath $localCfgPath -Encoding utf8
+        }
+    } catch {}
 }
 
 if (-not $Reajuste) {
@@ -29,6 +45,8 @@ if (-not $Reajuste) {
     Write-Host "==========================================================" -ForegroundColor Cyan
     Write-Host "  GitDoctor -- Suite de Salud y Git para Windows          " -ForegroundColor Cyan
     Write-Host "==========================================================" -ForegroundColor Cyan
+    Write-Host "  Carpeta raiz de proyectos: $reposDir" -ForegroundColor DarkGray
+    Write-Host "  Ubicacion de GitDoctor:    $scriptDir" -ForegroundColor DarkGray
     Write-Host ""
 
     # 1. Comprobar GitHub CLI
@@ -37,6 +55,7 @@ if (-not $Reajuste) {
         $ghUser = gh api user --jq .login 2>$null
         if ($ghUser) {
             Write-Host "      [OK] GitHub conectado como @$ghUser" -ForegroundColor Green
+            Write-Host "           Boveda Privada disponible: Usa 'gitdoctor /catalogo' para sincronizar tu inventario." -ForegroundColor DarkGray
         } else {
             Write-Host "      [INFO] GitHub CLI detectado sin sesion. Usa 'reposync-ai' o 'gh auth login' para iniciar sesion." -ForegroundColor Yellow
         }
@@ -66,21 +85,22 @@ foreach ($legacy in @("_sync", "repos-sync")) {
     }
 }
 
-# Limpiar clones duplicados o redundantes de GitDoctor en otras carpetas
-$dupCandidates = @(
-    (Join-Path $reposDir "_gitdoctor"),
-    (Join-Path $reposDir "gitdoctor"),
-    (Join-Path $reposDir "Personal\gitdoctor"),
-    (Join-Path $reposDir "Personal\repos-sync")
-)
-foreach ($dup in $dupCandidates) {
-    if (Test-Path $dup) {
-        $dupResolved = (Resolve-Path $dup -ErrorAction SilentlyContinue).Path
-        if ($dupResolved -and ($dupResolved.ToLower() -ne $scriptDir.ToLower())) {
-            if (Test-Path (Join-Path $dup "agent.py")) {
-                Remove-Item -Path $dup -Recurse -Force -ErrorAction SilentlyContinue
-            }
-        }
+# Limpiar clones duplicados o mal ubicados de GitDoctor en organizaciones o carpetas legacy
+foreach ($org in $knownOrgs) {
+    $orgDup = Join-Path $reposDir "$org\gitdoctor"
+    if ((Test-Path $orgDup) -and ($orgDup.ToLower() -ne $scriptDir.ToLower())) {
+        Remove-Item -Path $orgDup -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    $orgLegacy = Join-Path $reposDir "$org\repos-sync"
+    if (Test-Path $orgLegacy) {
+        Remove-Item -Path $orgLegacy -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+foreach ($legacy in @("_gitdoctor", "_sync", "repos-sync")) {
+    $legPath = Join-Path $reposDir $legacy
+    if ((Test-Path $legPath) -and ($legPath.ToLower() -ne $scriptDir.ToLower())) {
+        Remove-Item -Path $legPath -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -111,21 +131,10 @@ function gitdoctor {
     )
     `$candidates = @(
         "$scriptDir",
-        "D:\Repos\Personal\gitdoctor",
-        "`$HOME\Repos\Personal\gitdoctor",
-        "`$HOME\repos\Personal\gitdoctor",
-        "D:\Repos\_gitdoctor",
         "D:\Repos\gitdoctor",
-        "D:\Repos\_sync",
-        "`$HOME\Repos\_gitdoctor",
-        "`$HOME\repos\_gitdoctor",
         "`$HOME\Repos\gitdoctor",
         "`$HOME\repos\gitdoctor",
-        "`$HOME\Repos\_sync",
-        "`$HOME\repos\_sync",
-        "C:\Repos\Personal\gitdoctor",
-        "C:\Repos\_gitdoctor",
-        "C:\Repos\_sync"
+        "C:\Repos\gitdoctor"
     )
     `$foundDir = `$null
     foreach (`$d in `$candidates) {
@@ -138,7 +147,7 @@ function gitdoctor {
             python (Join-Path `$foundDir "agent.py") `$ArgsList
         }
     } else {
-        Write-Error "No se encontro agent.py en ninguna ruta conocida de GitDoctor."
+        Write-Error "No se encontro agent.py en las rutas conocidas de GitDoctor (D:\Repos\gitdoctor)."
     }
 }
 

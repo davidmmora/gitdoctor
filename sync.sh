@@ -8,14 +8,12 @@ set -e
 # Directorio del script y directorio padre de los repositorios
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PARENT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-GRANDPARENT_DIR="$(cd "$PARENT_DIR/.." && pwd)"
-
 PARENT_NAME="$(basename "$PARENT_DIR")"
-GRANDPARENT_NAME="$(basename "$GRANDPARENT_DIR" | tr '[:upper:]' '[:lower:]')"
 
-# Si GitDoctor reside en Personal/gitdoctor u otra organizacion oficial, REPOS_DIR es el abuelo
-if [[ "$PARENT_NAME" =~ ^(Personal|th-mex|w-amarillo|w-azul|w-naranja|interpec|w-pluma|w-ic|bf-agency|WeHubs-io)$ ]] || [[ "$GRANDPARENT_NAME" =~ ^(repos|proyectos|developer)$ ]]; then
-    REPOS_DIR="$GRANDPARENT_DIR"
+# REGLA ESTRICTA: GitDoctor reside UNICAMENTE en la raiz de repositorios
+if [[ "$PARENT_NAME" =~ ^(Personal|th-mex|w-amarillo|w-azul|w-naranja|interpec|w-pluma|w-ic|bf-agency|WeHubs-io)$ ]]; then
+    echo -e "\033[33m[AVISO] GitDoctor reside dentro de '$PARENT_NAME'. Por regla oficial debe estar unicamente en la raiz de repositorios.\033[0m"
+    REPOS_DIR="$(cd "$PARENT_DIR/.." && pwd)"
 else
     REPOS_DIR="$PARENT_DIR"
 fi
@@ -31,13 +29,11 @@ fi
 
 # Resolver catalogo: repos.local.json o repos.json
 CATALOG_FILE="$SCRIPT_DIR/repos.local.json"
-if [ ! -f "$CATALOG_FILE" ]; then
-    CATALOG_FILE="$SCRIPT_DIR/repos.json"
-fi
 
 AUTO_CLONE=true
 AUTO_PULL=true
 UPDATE_CATALOG=false
+PULL_VAULT=false
 
 # Procesar argumentos
 while [[ $# -gt 0 ]]; do
@@ -58,12 +54,17 @@ while [[ $# -gt 0 ]]; do
             UPDATE_CATALOG=true
             shift
             ;;
+        --vault|--pull-vault)
+            PULL_VAULT=true
+            shift
+            ;;
         -h|--help)
             echo "Uso: ./sync.sh [OPCIONES]"
             echo "  -t, --target-dir DIR Directorio donde residen los repositorios (por defecto ..)"
             echo "  --no-clone           No clonar repositorios faltantes"
             echo "  --no-pull            No hacer pull automatico de cambios remotos"
             echo "  --update-catalog     Escanear repositorios locales y actualizar repos.json"
+            echo "  --vault              Sincronizar catalogo privado desde la Boveda Gist Secreta"
             exit 0
             ;;
         *)
@@ -71,6 +72,28 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Sincronizar Boveda Privada si repos.local.json no existe o si se solicito explicitamente
+if [ "$PULL_VAULT" = true ] || [ ! -f "$CATALOG_FILE" ]; then
+    if command -v gh &>/dev/null && [ -f "$LOCAL_CFG" ]; then
+        VAULT_ID=$(python3 -c "import json; print(json.load(open('$LOCAL_CFG')).get('catalog_gist_id', ''))" 2>/dev/null || true)
+        if [ -n "$VAULT_ID" ]; then
+            echo -e "\033[36m[*] Sincronizando catalogo privado desde la Boveda Secreta ($VAULT_ID)...\033[0m"
+            gh api "/gists/$VAULT_ID" --jq '.files[] | .content' > "$SCRIPT_DIR/repos.local.json.tmp" 2>/dev/null || true
+            if [ -s "$SCRIPT_DIR/repos.local.json.tmp" ] && grep -q '\[' "$SCRIPT_DIR/repos.local.json.tmp"; then
+                mv "$SCRIPT_DIR/repos.local.json.tmp" "$SCRIPT_DIR/repos.local.json"
+                CATALOG_FILE="$SCRIPT_DIR/repos.local.json"
+                echo -e "\033[32m    [OK] Catalogo privado actualizado desde la Boveda.\033[0m"
+            else
+                rm -f "$SCRIPT_DIR/repos.local.json.tmp" 2>/dev/null || true
+            fi
+        fi
+    fi
+fi
+
+if [ ! -f "$CATALOG_FILE" ]; then
+    CATALOG_FILE="$SCRIPT_DIR/repos.json"
+fi
 
 # Colores ANSI
 C_RESET="\033[0m"

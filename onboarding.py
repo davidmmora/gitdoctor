@@ -202,8 +202,8 @@ def run_onboarding_assistant(repos_dir, interactive=True):
         print(f"{C_GRAY}Todos los repositorios estan agrupados por organizacion: <organizacion>/<repo>.{C_RESET}\n")
         return {"status": "already_organized"}
 
-    print(f"\n{C_YELLOW}[!] Regla de GitDoctor: NUNCA tener repositorios sueltos en la raiz.{C_RESET}")
-    print(f"{C_GRAY}Todo proyecto debe vivir dentro de una de las 10 organizaciones oficiales o 'Personal'.{C_RESET}\n")
+    print(f"\n{C_YELLOW}[!] Regla estricta: NUNCA tener proyectos de desarrollo sueltos en la raiz.{C_RESET}")
+    print(f"{C_GRAY}GitDoctor es el UNICO repositorio que reside en la raiz; todos tus proyectos deben vivir dentro de una organizacion oficial.{C_RESET}\n")
 
     if not interactive:
         return {"status": "needs_reorganization", "loose_repos": len(loose_repos), "loose_folders": len(loose_folders)}

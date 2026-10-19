@@ -2,9 +2,9 @@
 # GitDoctor Vigilante - Launcher para macOS
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ ! -f "$DIR/agent.py" ]; then
-    for cand in "$HOME/Repos/_sync/agent.py" "$HOME/repos/_sync/agent.py" "$HOME/Repos/repos-sync/agent.py"; do
-        if [ -f "$cand" ]; then
-            DIR="$(dirname "$cand")"
+    for cand in "$HOME/Repos/gitdoctor" "$HOME/repos/gitdoctor"; do
+        if [ -f "$cand/agent.py" ]; then
+            DIR="$cand"
             break
         fi
     done

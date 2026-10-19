@@ -2,9 +2,9 @@
 # GitDoctor - Sincronizacion para macOS
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ ! -f "$DIR/sync.sh" ]; then
-    for cand in "$HOME/Repos/_sync/sync.sh" "$HOME/repos/_sync/sync.sh" "$HOME/Repos/repos-sync/sync.sh"; do
-        if [ -f "$cand" ]; then
-            DIR="$(dirname "$cand")"
+    for cand in "$HOME/Repos/gitdoctor" "$HOME/repos/gitdoctor"; do
+        if [ -f "$cand/sync.sh" ]; then
+            DIR="$cand"
             break
         fi
     done

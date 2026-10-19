@@ -41,6 +41,7 @@ def main():
             pass
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
+    known_orgs = {"Personal", "th-mex", "w-amarillo", "w-azul", "w-naranja", "interpec", "w-pluma", "w-ic", "bf-agency", "WeHubs-io"}
 
     # Resolver catalogo: repos.local.json (si existe) o repos.json
     cat_local = os.path.join(script_dir, "repos.local.json")
@@ -63,10 +64,10 @@ def main():
                 pass
         if not repos_dir:
             parent = os.path.abspath(os.path.join(script_dir, ".."))
-            grandparent = os.path.abspath(os.path.join(parent, ".."))
-            known_orgs = {"Personal", "th-mex", "w-amarillo", "w-azul", "w-naranja", "interpec", "w-pluma", "w-ic", "bf-agency", "WeHubs-io"}
-            if os.path.basename(parent) in known_orgs or os.path.basename(grandparent).lower() in {"repos", "proyectos", "developer"}:
-                repos_dir = grandparent
+            # REGLA ESTRICTA: GitDoctor reside UNICAMENTE en la raiz de repositorios
+            if os.path.basename(parent) in known_orgs:
+                print(f"{C_YELLOW}[AVISO] GitDoctor reside dentro de '{os.path.basename(parent)}'. Por regla oficial debe estar unicamente en la raiz de repositorios.{C_RESET}")
+                repos_dir = os.path.abspath(os.path.join(parent, ".."))
             else:
                 repos_dir = parent
 
@@ -174,15 +175,16 @@ def main():
     # -------------------------------------------------------------
     print(f"{C_BOLD}--- [2/3] Deteccion de Discrepancias y Reorganizacion ---{C_RESET}")
 
-    # Limpieza automatica de clones duplicados o redundantes de GitDoctor
+    # Limpieza automatica de clones duplicados o mal ubicados de GitDoctor
     dup_candidates = [
         os.path.join(repos_dir, "_gitdoctor"),
-        os.path.join(repos_dir, "gitdoctor"),
         os.path.join(repos_dir, "_sync"),
         os.path.join(repos_dir, "repos-sync"),
-        os.path.join(repos_dir, "Personal", "gitdoctor"),
-        os.path.join(repos_dir, "Personal", "repos-sync")
     ]
+    for org in known_orgs:
+        dup_candidates.append(os.path.join(repos_dir, org, "gitdoctor"))
+        dup_candidates.append(os.path.join(repos_dir, org, "repos-sync"))
+
     for dup in dup_candidates:
         dup_abs = os.path.abspath(dup)
         if dup_abs != os.path.abspath(script_dir) and os.path.isdir(dup_abs):
@@ -191,7 +193,7 @@ def main():
                 try:
                     shutil.rmtree(dup_abs, ignore_errors=True)
                     rel_cleaned = os.path.relpath(dup_abs, repos_dir)
-                    print(f"  {C_GREEN}[LIMPIEZA] Se elimino el clon duplicado de GitDoctor en: {rel_cleaned}{C_RESET}")
+                    print(f"  {C_GREEN}[LIMPIEZA] Se elimino el clon mal ubicado/duplicado de GitDoctor en: {rel_cleaned}{C_RESET}")
                 except Exception:
                     pass
 
@@ -199,7 +201,7 @@ def main():
     already_matched = set()
 
     for r in inspected_repos:
-        # Excepcion absoluta: GitDoctor es la suite orquestadora y puede residir en raiz, Personal o cualquier ruta
+        # Excepcion absoluta: GitDoctor es la suite orquestadora y reside unicamente en la raiz
         if r['folder'] in ['_gitdoctor', 'gitdoctor', '_sync', 'repos-sync'] or os.path.abspath(r['path']) == os.path.abspath(script_dir) or r['norm_remote'].endswith('/gitdoctor') or r['norm_remote'].endswith('/repos-sync'):
             continue
 

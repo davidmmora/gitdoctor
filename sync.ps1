@@ -5,7 +5,8 @@ param(
     [string]$TargetDir = "",
     [switch]$NoClone,
     [switch]$NoPull,
-    [switch]$UpdateCatalog
+    [switch]$UpdateCatalog,
+    [switch]$Vault
 )
 
 $AutoClone = -not $NoClone
@@ -14,6 +15,28 @@ $AutoPull  = -not $NoPull
 $scriptDir = $PSScriptRoot
 if (-not $scriptDir) { $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition }
 if (-not $scriptDir) { $scriptDir = (Get-Location).Path }
+
+# Resolver Boveda Privada si repos.local.json no existe o si se solicita con -Vault
+$localCat = Join-Path $scriptDir "repos.local.json"
+if ($Vault -or (-not (Test-Path $localCat))) {
+    $localCfgFile = Join-Path $scriptDir "config.local.json"
+    if (Test-Path $localCfgFile) {
+        try {
+            $localCfg = Get-Content $localCfgFile -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($localCfg.catalog_gist_id -and (Get-Command gh -ErrorAction SilentlyContinue)) {
+                Write-Host "[*] Sincronizando catalogo privado desde la Boveda Secreta ($($localCfg.catalog_gist_id))..." -ForegroundColor Cyan
+                $vaultJson = gh api "/gists/$($localCfg.catalog_gist_id)" --jq '.files[] | .content' 2>$null
+                if (-not $vaultJson) {
+                    $vaultJson = gh gist view $localCfg.catalog_gist_id -f repos.local.json 2>$null
+                }
+                if ($vaultJson -and $vaultJson.Trim().StartsWith("[")) {
+                    $vaultJson | Out-File -FilePath $localCat -Encoding utf8
+                    Write-Host "    [OK] Catalogo privado actualizado desde la Boveda." -ForegroundColor Green
+                }
+            }
+        } catch {}
+    }
+}
 
 # Resolver catalogo: repos.local.json (si existe) o repos.json
 $catalogFile = Join-Path $scriptDir "repos.local.json"
@@ -34,14 +57,13 @@ if (-not $TargetDir) {
     }
     if (-not $reposDir) {
         $parentDir = Split-Path -Parent $scriptDir
-        $grandparentDir = Split-Path -Parent $parentDir
         $parentName = Split-Path -Leaf $parentDir
-        $grandparentName = ""
-        if ($grandparentDir) { $grandparentName = (Split-Path -Leaf $grandparentDir).ToLower() }
-
         $knownOrgs = @("Personal", "th-mex", "w-amarillo", "w-azul", "w-naranja", "interpec", "w-pluma", "w-ic", "bf-agency", "WeHubs-io")
-        if ($knownOrgs -contains $parentName -or $grandparentName -in @("repos", "proyectos", "developer")) {
-            $reposDir = $grandparentDir
+
+        # REGLA ESTRICTA: GitDoctor reside UNICAMENTE en la raiz de repositorios
+        if ($knownOrgs -contains $parentName) {
+            Write-Host "[AVISO] GitDoctor reside dentro de '$parentName'. Por regla oficial debe estar unicamente en la raiz de repositorios." -ForegroundColor Yellow
+            $reposDir = Split-Path -Parent $parentDir
         } else {
             $reposDir = $parentDir
         }

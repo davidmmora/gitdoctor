@@ -2364,6 +2364,25 @@ GEMINI_TOOLS = [
                     "type": "OBJECT",
                     "properties": {}
                 }
+            },
+            {
+                "name": "manage_catalog_vault",
+                "description": "Gestiona la Boveda Privada multi-equipo en GitHub Gist Secreto para sincronizar repos.local.json entre Windows y Mac de forma 100% privada y confidencial.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "action": {
+                            "type": "STRING",
+                            "description": "Accion: 'push' (subir catalogo), 'pull' (descargar catalogo), 'status' (ver estado de la boveda)",
+                            "enum": ["push", "pull", "status"]
+                        },
+                        "gist_id": {
+                            "type": "STRING",
+                            "description": "Opcional: ID del Gist secreto al hacer pull"
+                        }
+                    },
+                    "required": ["action"]
+                }
             }
         ]
     }
@@ -2850,6 +2869,13 @@ def execute_tool_call(tool_name, args, repos_dir, catalog, catalog_file, api_key
             return run_onboarding_assistant(repos_dir, interactive=True)
         return {"error": "Modulo onboarding no disponible"}
 
+    elif tool_name == "manage_catalog_vault":
+        act = args.get("action", "status")
+        g_id = args.get("gist_id")
+        gh_info = get_github_status()
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        return interactive_manage_catalog_vault(script_dir, local_cfg, gh_info, action=act, param=g_id, repos_dir=repos_dir)
+
     return {"error": f"Herramienta desconocida: {tool_name}"}
 
 # ==============================================================================
@@ -2921,17 +2947,17 @@ def import_repos_from_github(script_dir, gh_info):
     return {"success": True, "count": len(entries)}
 
 def resolve_repos_dir(script_dir, local_cfg=None):
-    """Resuelve la carpeta raiz de repositorios dinamicamente respetando config.local.json y arquitectura oficial"""
+    """Resuelve la carpeta raiz de repositorios (GitDoctor reside estrictamente en la raiz de repos)"""
     if local_cfg and local_cfg.get("repos_dir"):
         c_dir = local_cfg["repos_dir"].strip()
         if c_dir and os.path.isdir(c_dir):
             return os.path.abspath(c_dir)
 
     parent = os.path.abspath(os.path.join(script_dir, ".."))
-    grandparent = os.path.abspath(os.path.join(parent, ".."))
     known_orgs = {"Personal", "th-mex", "w-amarillo", "w-azul", "w-naranja", "interpec", "w-pluma", "w-ic", "bf-agency", "WeHubs-io"}
-    if os.path.basename(parent) in known_orgs or os.path.basename(grandparent).lower() in {"repos", "proyectos", "developer"}:
-        return grandparent
+    # REGLA ESTRICTA: GitDoctor reside UNICAMENTE en la raiz de repositorios
+    if os.path.basename(parent) in known_orgs:
+        return os.path.abspath(os.path.join(parent, ".."))
     return parent
 
 def set_custom_repos_dir(script_dir, local_cfg, new_dir=None):
@@ -3002,6 +3028,331 @@ def prepare_for_public_repo(script_dir):
     return {"success": True, "message": "Repositorio preparado y protegido para visibilidad publica."}
 
 # ==============================================================================
+# BOVEDA PRIVADA DE CATALOGO MULTI-EQUIPO (GITHUB GIST SECRETO)
+# ==============================================================================
+VAULT_GIST_DESC = "GitDoctor Private Catalog Vault"
+VAULT_FILENAME = "repos.vault.json"
+
+def find_existing_vault_gist():
+    """Busca un Gist Secreto existente en la cuenta del usuario para el catalogo privado"""
+    try:
+        res = subprocess.run(["gh", "api", "/gists", "--paginate"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=12)
+        if res.returncode == 0:
+            gists = json.loads(res.stdout.decode('utf-8'))
+            for g in gists:
+                files = g.get("files", {})
+                desc = g.get("description", "")
+                if VAULT_FILENAME in files or desc == VAULT_GIST_DESC:
+                    return g.get("id")
+    except Exception:
+        pass
+    return None
+
+def vault_get_configured_id(script_dir, local_cfg):
+    """Obtiene el ID del Gist configurado en config.local.json o intenta autodescubrirlo"""
+    gid = local_cfg.get("catalog_gist_id")
+    if gid:
+        return gid
+    found = find_existing_vault_gist()
+    if found:
+        local_cfg["catalog_gist_id"] = found
+        save_local_config(script_dir, local_cfg)
+        return found
+    return None
+
+def build_catalog_from_local_folders(repos_dir):
+    """Genera una lista de catalogo a partir de las carpetas locales de repositorios"""
+    entries = []
+    if not os.path.isdir(repos_dir):
+        return entries
+    try:
+        raw_items = sorted(os.listdir(repos_dir))
+    except Exception:
+        raw_items = []
+
+    for item in raw_items:
+        if item in ["_gitdoctor", "_sync", "gitdoctor", "repos-sync"] or item.startswith('.'):
+            continue
+        p1 = os.path.join(repos_dir, item)
+        if not os.path.isdir(p1):
+            continue
+
+        if os.path.isdir(os.path.join(p1, ".git")):
+            remote = run_cmd(['git', 'remote', 'get-url', 'origin'], cwd=p1)
+            b = run_cmd(['git', 'branch', '--show-current'], cwd=p1) or "main"
+            entries.append({
+                "name": item,
+                "group": "Personal",
+                "path": f"Personal/{item}",
+                "url": remote or f"https://github.com/davidmmora/{item}.git",
+                "defaultBranch": b
+            })
+        else:
+            try:
+                for sub in sorted(os.listdir(p1)):
+                    if sub.startswith('.'):
+                        continue
+                    p2 = os.path.join(p1, sub)
+                    if os.path.isdir(p2) and os.path.isdir(os.path.join(p2, ".git")):
+                        remote = run_cmd(['git', 'remote', 'get-url', 'origin'], cwd=p2)
+                        b = run_cmd(['git', 'branch', '--show-current'], cwd=p2) or "main"
+                        entries.append({
+                            "name": sub,
+                            "group": item,
+                            "path": f"{item}/{sub}",
+                            "url": remote or f"https://github.com/{item}/{sub}.git",
+                            "defaultBranch": b
+                        })
+            except Exception:
+                pass
+    return entries
+
+def vault_push_catalog(script_dir, local_cfg, gh_info, repos_dir=None):
+    """Sube el catalogo privado local (repos.local.json) a un GitHub Gist Secreto"""
+    if not gh_info.get('logged_in'):
+        print(f"\n{C_YELLOW}[!] Debes iniciar sesion primero en GitHub con /login.{C_RESET}\n")
+        return {"success": False, "error": "Not logged in"}
+
+    cat_local = os.path.join(script_dir, "repos.local.json")
+    cat_master = os.path.join(script_dir, "repos.json")
+
+    # Si repos.local.json no existe, intentar poblarlo desde los repos locales en disco
+    if not os.path.isfile(cat_local):
+        if repos_dir and os.path.isdir(repos_dir):
+            local_scanned = build_catalog_from_local_folders(repos_dir)
+            if local_scanned:
+                print(f"\n{C_CYAN}[*] No existia repos.local.json, pero se detectaron {len(local_scanned)} repos locales en tu disco.{C_RESET}")
+                try:
+                    ans = input(f"{C_BOLD}¿Deseas generar repos.local.json con estos repositorios para la Boveda? [S/n]: {C_RESET}").strip().lower()
+                except EOFError:
+                    ans = "s"
+                if ans in ["", "s", "si", "y", "yes"]:
+                    with open(cat_local, "w", encoding="utf-8") as f:
+                        json.dump(local_scanned, f, indent=4, ensure_ascii=False)
+                    print(f"  {C_GREEN}[OK] repos.local.json generado con {len(local_scanned)} repos.{C_RESET}")
+
+    target_file = cat_local if os.path.isfile(cat_local) else cat_master
+    if not os.path.isfile(target_file):
+        print(f"\n{C_RED}[ERROR] No se encontro ni repos.local.json ni repos.json para respaldar.{C_RESET}\n")
+        return {"success": False, "error": "No catalog file"}
+
+    try:
+        with open(target_file, "r", encoding="utf-8-sig") as f:
+            cat_data = json.load(f)
+    except Exception as e:
+        print(f"\n{C_RED}[ERROR] El archivo de catalogo esta dañado o no es JSON valido: {e}{C_RESET}\n")
+        return {"success": False, "error": str(e)}
+
+    # Validar que no sea solo el dummy de ejemplo
+    dummy_names = {"mi-proyecto-backend", "mi-proyecto-frontend", "mi-libreria-utilidades"}
+    real_repos = [r for r in cat_data if r.get("name") not in dummy_names]
+    if not real_repos and len(cat_data) <= 3:
+        print(f"\n{C_YELLOW}[!] Tu catalogo actual solo contiene la plantilla publica de ejemplo de GitDoctor.{C_RESET}")
+        print(f"{C_GRAY}Tip: Puedes usar /importar-github para escanear tus organizaciones reales en GitHub.{C_RESET}\n")
+        try:
+            proceed = input(f"{C_BOLD}¿Deseas subir la plantilla de todos modos a la Boveda? [s/N]: {C_RESET}").strip().lower()
+        except EOFError:
+            proceed = "n"
+        if proceed not in ["s", "si", "y", "yes"]:
+            return {"success": False, "error": "Cancelled by user"}
+
+    print(f"\n{C_CYAN}[*] Sincronizando catalogo con la Boveda Privada en GitHub Gist Secreto...{C_RESET}")
+    gist_id = vault_get_configured_id(script_dir, local_cfg)
+
+    if gist_id:
+        print(f"  * Actualizando Boveda existente (Gist ID: {gist_id})...")
+        cmd = ["gh", "gist", "edit", gist_id, "--filename", VAULT_FILENAME, target_file]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if res.returncode == 0:
+            print(f"\n{C_GREEN}[OK] ¡Boveda Privada actualizada exitosamente!{C_RESET}")
+            print(f"  * Repositorios respaldados: {C_BOLD}{len(cat_data)}{C_RESET}")
+            print(f"  * ID de tu Boveda: {C_CYAN}{gist_id}{C_RESET}")
+            print(f"  * Visibilidad: {C_GREEN}100% SECRETA / PRIVADA{C_RESET} (Inaccesible para terceros en GitHub)")
+            print(f"{C_GRAY}Ahora puedes descargar este catalogo en tus otros equipos ejecutando '/catalogo pull'.{C_RESET}\n")
+            return {"success": True, "gist_id": gist_id, "count": len(cat_data)}
+        else:
+            err = res.stderr.decode('utf-8', errors='ignore')
+            print(f"  {C_YELLOW}[!] No se pudo editar el Gist {gist_id} ({err.strip()}). Creando nueva Boveda...{C_RESET}")
+
+    # Si no existia o fallo la edicion, crear nuevo Gist Secreto
+    cmd = ["gh", "gist", "create", "--desc", VAULT_GIST_DESC, "--filename", VAULT_FILENAME, target_file]
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if res.returncode == 0:
+        out = res.stdout.decode('utf-8', errors='ignore').strip()
+        new_id = out.rstrip('/').split('/')[-1]
+        local_cfg["catalog_gist_id"] = new_id
+        save_local_config(script_dir, local_cfg)
+        print(f"\n{C_GREEN}[OK] ¡Boveda Privada creada exitosamente en tu cuenta @{gh_info.get('user')}!{C_RESET}")
+        print(f"  * Repositorios respaldados: {C_BOLD}{len(cat_data)}{C_RESET}")
+        print(f"  * ID de tu Boveda: {C_CYAN}{new_id}{C_RESET}")
+        print(f"  * Visibilidad: {C_GREEN}100% SECRETA / PRIVADA{C_RESET} (Solo tu cuenta @{gh_info.get('user')} tiene acceso)")
+        print(f"{C_GRAY}Tu ID quedo guardado en config.local.json. En tu otro equipo solo escribe '/catalogo pull'.{C_RESET}\n")
+        return {"success": True, "gist_id": new_id, "count": len(cat_data)}
+    else:
+        err = res.stderr.decode('utf-8', errors='ignore')
+        print(f"\n{C_RED}[ERROR] No se pudo crear el Gist Secreto en GitHub: {err.strip()}{C_RESET}\n")
+        return {"success": False, "error": err}
+
+def fetch_vault_raw_json(gist_id):
+    """Obtiene el JSON puro de la Boveda sin importar el nombre interno del archivo"""
+    # 1. Probar via gh api
+    try:
+        cmd = ["gh", "api", f"/gists/{gist_id}"]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=12)
+        if res.returncode == 0:
+            gdata = json.loads(res.stdout.decode('utf-8'))
+            files = gdata.get("files", {})
+            for fname in ["repos.vault.json", "repos.local.json"]:
+                if fname in files and files[fname].get("content"):
+                    return files[fname]["content"]
+            # Tomar el primer archivo que comience como lista JSON
+            for fname, finfo in files.items():
+                content = finfo.get("content", "")
+                if content and content.strip().startswith("["):
+                    return content
+    except Exception:
+        pass
+
+    # 2. Probar con gh gist view especificando nombres comunes
+    for fn in ["repos.local.json", "repos.vault.json"]:
+        cmd = ["gh", "gist", "view", gist_id, "-f", fn]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10)
+        if res.returncode == 0 and res.stdout:
+            txt = res.stdout.decode('utf-8', errors='ignore').strip()
+            if txt.startswith("["):
+                return txt
+
+    return None
+
+def vault_pull_catalog(script_dir, local_cfg, gh_info, target_gist_id=None):
+    """Descarga el catalogo privado desde el GitHub Gist Secreto y lo guarda en repos.local.json"""
+    if not gh_info.get('logged_in'):
+        print(f"\n{C_YELLOW}[!] Debes iniciar sesion primero en GitHub con /login.{C_RESET}\n")
+        return {"success": False, "error": "Not logged in"}
+
+    gist_id = target_gist_id or vault_get_configured_id(script_dir, local_cfg)
+
+    if not gist_id:
+        print(f"\n{C_YELLOW}[?] No se encontro ninguna Boveda vinculada en esta maquina.{C_RESET}")
+        try:
+            ans = input(f"{C_BOLD}Ingresa el ID o URL del Gist Secreto (o Enter para cancelar): {C_RESET}").strip()
+        except EOFError:
+            ans = ""
+        if not ans:
+            print(f"{C_GRAY}Tip: Ejecuta '/catalogo push' en tu equipo principal para subir el catalogo primero.{C_RESET}\n")
+            return {"success": False, "error": "No gist id"}
+        gist_id = ans.rstrip('/').split('/')[-1]
+
+    print(f"\n{C_CYAN}[*] Descargando catalogo privado desde la Boveda Secreta ({gist_id})...{C_RESET}")
+
+    raw_json = fetch_vault_raw_json(gist_id)
+    if not raw_json:
+        print(f"\n{C_RED}[ERROR] No se pudo leer el contenido de la Boveda {gist_id} desde GitHub.{C_RESET}\n")
+        return {"success": False, "error": "Could not fetch vault content"}
+    try:
+        cat_data = json.loads(raw_json)
+        if not isinstance(cat_data, list):
+            raise ValueError("El formato del catalogo debe ser una lista JSON de repositorios.")
+    except Exception as e:
+        print(f"\n{C_RED}[ERROR] El contenido descargado no es un catalogo valido: {e}{C_RESET}\n")
+        return {"success": False, "error": str(e)}
+
+    cat_local = os.path.join(script_dir, "repos.local.json")
+    if os.path.isfile(cat_local):
+        import shutil
+        shutil.copyfile(cat_local, cat_local + ".bak")
+
+    with open(cat_local, "w", encoding="utf-8") as f:
+        json.dump(cat_data, f, indent=4, ensure_ascii=False)
+
+    local_cfg["catalog_gist_id"] = gist_id
+    save_local_config(script_dir, local_cfg)
+
+    orgs_found = set(r.get("group", "Otros") for r in cat_data)
+
+    print(f"\n{C_GREEN}[OK] ¡Catalogo privado descargado y activado exitosamente!{C_RESET}")
+    print(f"  * Archivo local: {C_BOLD}repos.local.json{C_RESET} (ignorado por Git, 100% confidencial)")
+    print(f"  * Total repositorios: {C_BOLD}{len(cat_data)}{C_RESET}")
+    print(f"  * Organizaciones: {C_CYAN}{', '.join(sorted(orgs_found))}{C_RESET}")
+    print(f"{C_GRAY}Ahora puedes ejecutar '/sync' para clonar o poner al dia todos tus proyectos en este equipo.{C_RESET}\n")
+    return {"success": True, "count": len(cat_data), "gist_id": gist_id}
+
+def vault_show_status(script_dir, local_cfg, gh_info):
+    """Muestra el estado de la Boveda Privada y del catalogo local"""
+    cat_local = os.path.join(script_dir, "repos.local.json")
+    cat_master = os.path.join(script_dir, "repos.json")
+
+    has_local = os.path.isfile(cat_local)
+    active_cat = cat_local if has_local else cat_master
+
+    count = 0
+    orgs = set()
+    if os.path.isfile(active_cat):
+        try:
+            with open(active_cat, "r", encoding="utf-8-sig") as f:
+                d = json.load(f)
+                count = len(d)
+                orgs = set(r.get("group", "Otros") for r in d)
+        except Exception:
+            pass
+
+    gist_id = vault_get_configured_id(script_dir, local_cfg)
+
+    print(f"\n{C_CYAN}================================================================{C_RESET}")
+    print(f"{C_CYAN}  Boveda Privada de Catalogo Multi-Equipo (GitHub Gist Secreto) {C_RESET}")
+    print(f"{C_CYAN}================================================================{C_RESET}")
+    print(f"{C_BOLD}Catalogo Local en este equipo:{C_RESET}")
+    if has_local:
+        print(f"  * Archivo activo: {C_GREEN}repos.local.json{C_RESET} (Privado, protegido por .gitignore)")
+    else:
+        print(f"  * Archivo activo: {C_YELLOW}repos.json{C_RESET} (Plantilla publica de ejemplo)")
+    print(f"  * Total repositorios: {C_BOLD}{count}{C_RESET}")
+    print(f"  * Organizaciones: {C_GRAY}{', '.join(sorted(orgs)) or 'Ninguna'}{C_RESET}\n")
+
+    print(f"{C_BOLD}Boveda Remota en GitHub (Gist Secreto):{C_RESET}")
+    if gist_id:
+        print(f"  * ID Boveda: {C_CYAN}{gist_id}{C_RESET} (Vinculada)")
+        print(f"  * Cuenta: {C_GREEN}@{gh_info.get('user', 'desconocido')}{C_RESET}")
+        print(f"  * Visibilidad: {C_GREEN}100% SECRETA / PRIVADA{C_RESET} (Solo tu sesion de GitHub CLI)")
+    else:
+        print(f"  * Estado: {C_YELLOW}[!] Ninguna Boveda vinculada aun en este equipo.{C_RESET}")
+        print(f"  * Usa {C_WHITE}/catalogo push{C_RESET} para respaldar o {C_WHITE}/catalogo pull{C_RESET} para descargar.")
+
+    print(f"\n{C_GRAY}Comandos directos:{C_RESET}")
+    print(f"  * {C_WHITE}/catalogo push{C_RESET} : Sube tu repos.local.json a la Boveda Secreta")
+    print(f"  * {C_WHITE}/catalogo pull{C_RESET} : Descarga el catalogo privado de la Boveda a esta maquina")
+    print(f"  * {C_WHITE}/catalogo status{C_RESET} : Muestra este panel de estado\n")
+
+def interactive_manage_catalog_vault(script_dir, local_cfg, gh_info, action=None, param=None, repos_dir=None):
+    """Manejador interactivo o directo del comando /catalogo"""
+    act = (action or "").strip().lower()
+    if act in ["push", "subir", "guardar", "respaldar"]:
+        return vault_push_catalog(script_dir, local_cfg, gh_info, repos_dir=repos_dir)
+    elif act in ["pull", "bajar", "descargar", "sync", "sincronizar"]:
+        return vault_pull_catalog(script_dir, local_cfg, gh_info, target_gist_id=param)
+    elif act in ["status", "estado", "info"]:
+        vault_show_status(script_dir, local_cfg, gh_info)
+        return {"status": "shown"}
+    else:
+        vault_show_status(script_dir, local_cfg, gh_info)
+        print(f"{C_BOLD}¿Que deseas hacer?{C_RESET}")
+        print(f"  {C_WHITE}[1]{C_RESET} {C_GREEN}Subir catalogo local a la Boveda Privada (/catalogo push){C_RESET}")
+        print(f"  {C_WHITE}[2]{C_RESET} {C_CYAN}Descargar catalogo de la Boveda Privada (/catalogo pull){C_RESET}")
+        print(f"  {C_WHITE}[3]{C_RESET} {C_YELLOW}Auto-descubrir repositorios desde GitHub CLI (/importar-github){C_RESET}")
+        print(f"  {C_WHITE}[Enter]{C_RESET} Salir")
+        try:
+            choice = input(f"\n{C_BOLD}Selecciona una opcion [1/2/3]: {C_RESET}").strip()
+        except (EOFError, KeyboardInterrupt):
+            choice = ""
+        if choice == "1":
+            return vault_push_catalog(script_dir, local_cfg, gh_info, repos_dir=repos_dir)
+        elif choice == "2":
+            return vault_pull_catalog(script_dir, local_cfg, gh_info)
+        elif choice == "3":
+            return import_repos_from_github(script_dir, gh_info)
+        return {"status": "cancelled"}
+
+# ==============================================================================
 # CATALOGO DE COMANDOS MANUALES (HELPME) Y REPOSO DE IA
 # ==============================================================================
 def print_helpme_commands():
@@ -3022,6 +3373,7 @@ def print_helpme_commands():
     print(f"  * {C_WHITE}/apagar{C_RESET} (o {C_WHITE}checkout{C_RESET})       : Auditoria pre-flight de salida segura antes de apagar o cambiar a Mac.\n")
 
     print(f"{C_BOLD}{C_CYAN}🔄 SINCRONIZACION Y GESTION DE CODIGO:{C_RESET}")
+    print(f"  * {C_WHITE}/catalogo{C_RESET} [push|pull|status]: Gestiona tu Boveda Privada (Gist Secreto) para compartir repos entre Windows y Mac.")
     print(f"  * {C_WHITE}/sync{C_RESET} [org]               : Descarga cambios remotos en paralelo con pull lineal (--ff-only).")
     print(f"  * {C_WHITE}/push{C_RESET} [repo|all]          : Sube a GitHub los commits locales que van adelante.")
     print(f"  * {C_WHITE}/commit <repo> <msg>{C_RESET}       : Hace stage, commit y push de cambios pendientes con trailer oficial.")
@@ -3099,6 +3451,9 @@ COMMAND_MAP = {
     "clonar": "/clone",
     "bajar": "/clone",
     "descargar": "/clone",
+    "catalogo": "/catalogo",
+    "boveda": "/catalogo",
+    "vault": "/catalogo",
     "disponibles": "/disponibles",
     "faltantes": "/disponibles",
     "disco": "/disco",
@@ -3171,7 +3526,7 @@ COMMAND_MAP = {
 CANONICAL_SLASH_COMMANDS = [
     "/code", "/orgs", "/modo", "/clone", "/disponibles", "/nuevos", "/salud", "/seguridad",
     "/gitflow", "/onboarding", "/limpiar", "/disco", "/sync", "/push", "/commit", "/apagar",
-    "/vigilante", "/github", "/perfiles", "/login", "/switch", "/logout", "/git-id", "/dir",
+    "/vigilante", "/github", "/perfiles", "/catalogo", "/login", "/switch", "/logout", "/git-id", "/dir",
     "/importar-github", "/publico", "/ia", "/set-key", "/ayuda", "/helpme", "/salir"
 ]
 
@@ -3279,6 +3634,27 @@ def main():
 
     # Estado de GitHub CLI y Organizaciones
     gh_info = get_github_status()
+
+    # Boveda Privada: Si no existe repos.local.json pero existe una Boveda en GitHub Gist Secreto
+    if not os.path.isfile(cat_local) and gh_info.get("logged_in"):
+        existing_vault = vault_get_configured_id(script_dir, local_cfg)
+        if existing_vault:
+            print(f"\n{C_CYAN}🔐 [Boveda Privada Detectada]: Se encontro tu catalogo privado en GitHub Gist Secreto ({existing_vault}).{C_RESET}")
+            try:
+                ans = input(f"{C_BOLD}¿Deseas descargar tu catalogo privado a esta maquina ahora? [S/n]: {C_RESET}").strip().lower()
+            except EOFError:
+                ans = "s"
+            if ans in ["", "s", "si", "y", "yes"]:
+                res = vault_pull_catalog(script_dir, local_cfg, gh_info, target_gist_id=existing_vault)
+                if res.get("success"):
+                    catalog_file = cat_local
+                    try:
+                        with open(catalog_file, "r", encoding="utf-8-sig") as f:
+                            catalog = json.load(f)
+                        catalog = [c for c in catalog if c.get("name") not in ["gitdoctor", "repos-sync"] and not c.get("url", "").endswith("/gitdoctor.git") and not c.get("url", "").endswith("/repos-sync.git")]
+                    except Exception:
+                        pass
+
     all_known_orgs = get_active_orgs(repos_dir, gh_info)
 
     disabled_orgs = set(local_cfg.get("disabled_orgs", []))
@@ -3330,6 +3706,7 @@ def main():
     print(f"  {C_BOLD}/ia{C_RESET}                        {C_GRAY}Alternar motor de IA (Ollama Local Offline vs Gemini Cloud){C_RESET}")
     print(f"  {C_BOLD}/onboarding{C_RESET}                {C_GRAY}Diagnosticar y reorganizar proyectos sueltos en organizaciones{C_RESET}")
     print(f"  {C_BOLD}/code <repo>{C_RESET}              {C_GRAY}Abrir proyecto en Visual Studio Code{C_RESET}")
+    print(f"  {C_BOLD}/catalogo{C_RESET} [push|pull]       {C_GRAY}Boveda Privada en Gist Secreto para compartir repos entre Mac y PC{C_RESET}")
     print(f"  {C_BOLD}/sync{C_RESET}                     {C_GRAY}Sincronizar y descargar cambios remotos en paralelo{C_RESET}")
     print(f"  {C_BOLD}/push{C_RESET}                     {C_GRAY}Subir commits locales pendientes a GitHub{C_RESET}")
     print(f"  {C_BOLD}/disco{C_RESET} (o /prune)         {C_GRAY}Analizar y purgar carpetas pesadas (node_modules, etc.){C_RESET}")
@@ -3540,6 +3917,26 @@ def main():
             disabled_orgs = set(local_cfg.get("disabled_orgs", []))
             enabled_orgs = [o for o in all_known_orgs if o not in disabled_orgs]
             system_instruction = build_system_instruction(enabled_orgs)
+            continue
+
+        elif canon_cmd == "/catalogo":
+            parts = rest.split(None, 1) if rest else []
+            act = parts[0] if len(parts) >= 1 else None
+            p_arg = parts[1] if len(parts) >= 2 else None
+            interactive_manage_catalog_vault(script_dir, local_cfg, gh_info, action=act, param=p_arg, repos_dir=repos_dir)
+            cat_local = os.path.join(script_dir, "repos.local.json")
+            if os.path.isfile(cat_local):
+                catalog_file = cat_local
+                try:
+                    with open(catalog_file, "r", encoding="utf-8-sig") as f:
+                        catalog = json.load(f)
+                    catalog = [c for c in catalog if c.get("name") not in ["gitdoctor", "repos-sync"] and not c.get("url", "").endswith("/gitdoctor.git") and not c.get("url", "").endswith("/repos-sync.git")]
+                except Exception:
+                    pass
+                all_known_orgs = get_active_orgs(repos_dir, gh_info)
+                disabled_orgs = set(local_cfg.get("disabled_orgs", [])) if local_cfg.get("sync_mode") == "selective" else set()
+                enabled_orgs = [o for o in all_known_orgs if o not in disabled_orgs]
+                system_instruction = build_system_instruction(enabled_orgs, user_name=gh_info.get('name') or gh_info.get('user'))
             continue
 
         elif canon_cmd == "/importar-github":

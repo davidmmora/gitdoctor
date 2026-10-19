@@ -6,7 +6,7 @@ Este documento registra la evolución del ecosistema **RepoSync**, el trabajo co
 
 ## 📌 1. Visión y Estado Actual del Proyecto
 
-RepoSync es el núcleo de gestión, auditoría y sincronización de repositorios de desarrollo para entornos multi-equipo (**PC con Windows** en `D:\Repos` y **macOS** en `~/Repos`).
+GitDoctor es el núcleo de gestión, auditoría y sincronización de repositorios de desarrollo para entornos multi-equipo en Windows, macOS y Linux, agnóstico de la unidad de disco o ruta base elegida por el usuario (ej. `D:\Repos`, `C:\Proyectos`, `~/Developer`, `~/Repos`).
 
 ### 🏛️ Componentes Principales:
 * **Catálogo Maestro (`repos.json`):** Inventario con 106 repositorios distribuidos originalmente en 10 organizaciones.
@@ -152,3 +152,5 @@ A continuación se detalla el plan de implementación para las nuevas capacidade
 | **v2.6** | 19-Oct-2026 | Resiliencia de Gemini AI: filtro anti-omni, detección de 429 Rate Limit, comando `/helpme` y cuenta regresiva de reposo interactiva. |
 | **v3.0** | 19-Oct-2026 | Asistente de Onboarding Pre-Instalación (`onboarding.py`), Auditoría de Salud 360° con escáner de secretos/API keys y módulo interactivo de Gitflow (`/gitflow`). |
 | **v3.5** | 19-Oct-2026 | **Evolución a GitDoctor:** Comandos CLI `gitdoctor` / `gitdoc`, Motor Multi-IA (Ollama Local Offline + Gemini Cloud), soporte Multi-Trabajo y Multi-Proveedor (GitHub, GitLab, Bitbucket, Azure). |
+| **v3.6** | 19-Oct-2026 | **Regla Estricta de Ubicación:** Se establece como política inquebrantable que GitDoctor reside única y exclusivamente en la raíz (`~/Repos/gitdoctor` o `D:\Repos\gitdoctor`), fuera de toda organización. Limpieza automática de duplicados y blindaje de comandos globales. |
+| **v3.7** | 19-Oct-2026 | **Bóveda Privada de Catálogo Multi-Equipo:** Sincronización confidencial de `repos.local.json` entre Windows y Mac mediante GitHub Gist Secreto (`/catalogo push`, `/catalogo pull`, `/catalogo status`). Zero fugas en el repositorio público y sincronización automática. |

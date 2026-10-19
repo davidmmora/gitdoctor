@@ -16,6 +16,7 @@ Una vez instalado, tienes disponibles los comandos desde cualquier terminal:
 | Comando | Alias Corto | Descripción |
 | :--- | :---: | :--- |
 | `gitdoctor` | `gitdoc` | Abre la consola clínica interactiva con IA y herramientas DevOps. |
+| `gitdoctor /catalogo` | `gitdoc /boveda` | **Bóveda Privada (Gist Secreto):** Sincroniza tu catálogo confidencial entre Windows y Mac. |
 | `gitdoctor /salud 360` | `gitdoc /seguridad` | **Auditoría de Salud 360°:** Secretos, API keys, Gitflow, higiene e integridad. |
 | `gitdoctor /gitflow` | `gitdoc /gitflow` | Audita y crea la rama `develop` para estructurar Gitflow en tus repositorios. |
 | `gitdoctor /ia` | `gitdoc /ia` | Alterna entre IA Local Offline (Ollama) y Nube (Gemini Cloud). |
@@ -26,24 +27,26 @@ Una vez instalado, tienes disponibles los comandos desde cualquier terminal:
 
 ## 📂 ¿Cómo está estructurado?
 
-GitDoctor organiza automáticamente el código por **Organización o Grupo**, garantizando cero repositorios sueltos en la raíz:
+GitDoctor organiza automáticamente el código por **Organización o Grupo**, garantizando cero repositorios de código sueltos en la raíz:
 
 ```text
 <Tu_Carpeta_De_Proyectos>/         <-- (Ej. D:\Repos, C:\Proyectos, ~/Developer, ~/Repos)
 |
++-- gitdoctor/                     <-- NÚCLEO DE GITDOCTOR (Únicamente en la raíz, fuera de toda org)
+|   +-- agent.py                   <-- Consola clínica GitDoctor AI y motor multihilo
+|   +-- onboarding.py              <-- Asistente de diagnóstico y reorganización inicial
+|   +-- repos.json                 <-- Catálogo público / plantilla de ejemplo
+|   +-- repos.local.json           <-- (Privado) Catálogo maestro de tus repositorios reales
+|   +-- config.local.json          <-- (Privado) Configuración local y motor de IA
+|   +-- sync.ps1 / sync.sh         <-- Motores de sincronización paralela y auto-reajuste
+|   +-- setup-windows.bat/.ps1     <-- Instalador y configurador para Windows
+|   +-- setup-mac.sh               <-- Instalador y configurador para macOS
+|   +-- docs/                      <-- Documentación y planes de evolución
+|   +-- run-*.bat / .command       <-- Lanzadores directos
+|
 +-- Personal/                      <-- Proyectos personales y herramientas
-|   +-- gitdoctor/                 <-- NÚCLEO DE GITDOCTOR (código, catálogo y suite DevOps)
-|   |   +-- agent.py               <-- Consola clínica GitDoctor AI y motor multihilo
-|   |   +-- onboarding.py          <-- Asistente de diagnóstico y reorganización inicial
-|   |   +-- repos.json             <-- Catálogo público / plantilla de ejemplo
-|   |   +-- repos.local.json       <-- (Privado) Catálogo maestro de tus repositorios reales
-|   |   +-- config.local.json      <-- (Privado) Configuración local y motor de IA
-|   |   +-- sync.ps1 / sync.sh     <-- Motores de sincronización paralela y auto-reajuste
-|   |   +-- setup-windows.bat/.ps1 <-- Instalador y configurador para Windows
-|   |   +-- setup-mac.sh           <-- Instalador y configurador para macOS
-|   |   +-- docs/                  <-- Documentación y planes de evolución
-|   |   +-- run-*.bat / .command   <-- Lanzadores directos
 |   +-- mi-libreria/
+|   +-- web-app/
 |
 +-- organizacion-1/                <-- Repositorios de tu empresa / trabajo principal
 |   +-- proyecto-a/
@@ -53,25 +56,29 @@ GitDoctor organiza automáticamente el código por **Organización o Grupo**, ga
     +-- proyecto-c/
 ```
 
+> **Regla de Gobernanza:** GitDoctor reside **exclusivamente en la raíz** de tu carpeta principal de proyectos para evitar dependencias circulares, conflictos de sincronización o duplicados fantasma. Todos los proyectos de desarrollo se distribuyen dentro de sus respectivas organizaciones oficiales.
+>
+> 💡 **Libertad Total de Unidad y Ruta:** Puedes crear y designar tu carpeta raíz de proyectos donde prefieras (`D:\Repos`, `C:\Proyectos`, `E:\Workspace`, `~/Developer`, `~/Repos`, etc.). GitDoctor detecta automáticamente su ubicación relativa respecto a su carpeta contenedora y la almacena en `config.local.json`. Si en cualquier momento deseas mover o redefinir tu raíz, puedes usar el comando interactivo `gitdoctor /dir [nueva_ruta]`.
+
 ---
 
 ## ⚡ Instalación Inicial (1-Clic)
 
-Elige la carpeta raíz donde deseas tener tus proyectos (ej: `D:\Repos`, `~/Repos`) y clona GitDoctor dentro de la organización `Personal`:
+Elige la carpeta raíz donde deseas tener tus proyectos (en cualquier unidad o ruta, ej: `D:\Repos`, `C:\Proyectos`, `~/Developer`, `~/Repos`) y clona GitDoctor **directamente en esa raíz**:
 
 ### En Windows (PC)
-1. Abre tu terminal (PowerShell o CMD) en tu carpeta de repositorios (ej: `D:\Repos`):
+1. Abre tu terminal (PowerShell o CMD) en tu carpeta de repositorios (ej: `D:\Repos` o `C:\Proyectos`):
    ```cmd
-   git clone https://github.com/davidmmora/gitdoctor.git Personal\gitdoctor
-   cd Personal\gitdoctor
+   git clone https://github.com/davidmmora/gitdoctor.git gitdoctor
+   cd gitdoctor
    setup-windows.bat
    ```
 
 ### En macOS (Mac)
-1. Abre la Terminal en tu carpeta de repositorios (ej: `~/Repos`):
+1. Abre la Terminal en tu carpeta de repositorios (ej: `~/Repos` o `~/Developer`):
    ```bash
-   git clone https://github.com/davidmmora/gitdoctor.git ~/Repos/Personal/gitdoctor
-   cd ~/Repos/Personal/gitdoctor
+   git clone https://github.com/davidmmora/gitdoctor.git gitdoctor
+   cd gitdoctor
    bash setup-mac.sh
    ```
 
@@ -191,6 +198,7 @@ Todos los comandos se pueden escribir con barra (`/comando`) o sin barra (`coman
 | **`/logout`** | `logout`, `desconectar` | Cierra sesión de una cuenta de GitHub | `logout` |
 | **`/git-id`** | `git-id`, `identidad` | Configura `user.name` y `user.email` para Git | `git-id "Juan Perez" juan@empresa.com` |
 | **`/dir`** | `dir`, `carpeta` | Ver o cambiar la carpeta raíz de repositorios | `dir D:\MisProyectos` |
+| **`/catalogo`**| `catalogo`, `boveda`, `vault` | Sincroniza tu catálogo privado vía GitHub Gist Secreto | `/catalogo push` o `/catalogo pull` |
 | **`/importar-github`**| `mis-repos`, `descubrir` | Descarga todos tus repos de GitHub a tu catálogo personal | `mis-repos` |
 | **`/set-key`** | `set-key`, `key` | Configura tu API Key privada de Gemini AI | `set-key` |
 | **`/ayuda`** | `ayuda`, `help` | Muestra la guía interactiva en consola | `ayuda` |
