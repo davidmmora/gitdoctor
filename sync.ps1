@@ -60,9 +60,8 @@ if (-not $TargetDir) {
         $parentName = Split-Path -Leaf $parentDir
         $knownOrgs = @("Personal", "th-mex", "w-amarillo", "w-azul", "w-naranja", "interpec", "w-pluma", "w-ic", "bf-agency", "WeHubs-io")
 
-        # REGLA ESTRICTA: GitDoctor reside UNICAMENTE en la raiz de repositorios
-        if ($knownOrgs -contains $parentName) {
-            Write-Host "[AVISO] GitDoctor reside dentro de '$parentName'. Por regla oficial debe estar unicamente en la raiz de repositorios." -ForegroundColor Yellow
+        # Si GitDoctor reside dentro de una organizacion, la raiz de repos es el padre superior
+        if ($knownOrgs -contains $parentName -or $parentName -eq "Personal") {
             $reposDir = Split-Path -Parent $parentDir
         } else {
             $reposDir = $parentDir
@@ -157,6 +156,13 @@ if (-not (Test-Path $catalogFile)) {
 }
 
 $catalog = Get-Content $catalogFile -Raw -Encoding UTF8 | ConvertFrom-Json
+
+# Si el catalogo actual es la plantilla publica de ejemplo, no intentar clonar repos falsos
+$isDummy = ($catalog | Where-Object { $_.name -like "*mi-proyecto*" -or $_.url -like "*mi-organizacion*" })
+if ($isDummy -and (-not (Test-Path (Join-Path $scriptDir "repos.local.json")))) {
+    Write-Host "[INFO] Se detecto la plantilla repos.json de ejemplo. Ejecuta el instalador o 'gitdoctor /catalogo' para escanear tus proyectos reales.`n" -ForegroundColor Yellow
+    exit 0
+}
 
 # Leer configuracion local de maquina (organizaciones habilitadas/deshabilitadas)
 $localCfgFile = Join-Path $scriptDir "config.local.json"

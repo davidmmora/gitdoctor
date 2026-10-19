@@ -10,20 +10,21 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PARENT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PARENT_NAME="$(basename "$PARENT_DIR")"
 
-# REGLA ESTRICTA: GitDoctor reside UNICAMENTE en la raiz de repositorios
-if [[ "$PARENT_NAME" =~ ^(Personal|th-mex|w-amarillo|w-azul|w-naranja|interpec|w-pluma|w-ic|bf-agency|WeHubs-io)$ ]]; then
-    echo -e "\033[33m[AVISO] GitDoctor reside dentro de '$PARENT_NAME'. Por regla oficial debe estar unicamente en la raiz de repositorios.\033[0m"
-    REPOS_DIR="$(cd "$PARENT_DIR/.." && pwd)"
-else
-    REPOS_DIR="$PARENT_DIR"
-fi
-
 # Leer repos_dir personalizado si existe en config.local.json
 LOCAL_CFG="$SCRIPT_DIR/config.local.json"
+REPOS_DIR=""
 if [ -f "$LOCAL_CFG" ]; then
     CUSTOM_DIR=$(python3 -c "import json; print(json.load(open('$LOCAL_CFG')).get('repos_dir', ''))" 2>/dev/null || true)
     if [ -n "$CUSTOM_DIR" ] && [ -d "$CUSTOM_DIR" ]; then
         REPOS_DIR="$CUSTOM_DIR"
+    fi
+fi
+
+if [ -z "$REPOS_DIR" ]; then
+    if [[ "$PARENT_NAME" =~ ^(Personal|th-mex|w-amarillo|w-azul|w-naranja|interpec|w-pluma|w-ic|bf-agency|WeHubs-io)$ ]]; then
+        REPOS_DIR="$(cd "$PARENT_DIR/.." && pwd)"
+    else
+        REPOS_DIR="$PARENT_DIR"
     fi
 fi
 
@@ -196,6 +197,31 @@ fi
 if [ ! -f "$CATALOG_FILE" ]; then
     echo -e "${C_RED}[ERROR] No se encontro repos.json en $SCRIPT_DIR.${C_RESET}"
     exit 1
+fi
+
+# Comprobar si el catalogo es la plantilla publica de ejemplo
+IS_DUMMY=$(python3 -c "
+import os, json
+cat_file = '$CATALOG_FILE'
+script_dir = '$SCRIPT_DIR'
+if os.path.isfile(cat_file):
+    try:
+        data = json.load(open(cat_file))
+        is_d = any('mi-proyecto' in c.get('name', '') or 'mi-organizacion' in c.get('url', '') for c in data)
+        if is_d and not os.path.isfile(os.path.join(script_dir, 'repos.local.json')):
+            print('true')
+        else:
+            print('false')
+    except Exception:
+        print('false')
+else:
+    print('false')
+" 2>/dev/null || echo "false")
+
+if [ "$IS_DUMMY" = "true" ]; then
+    echo -e "${C_YELLOW}[INFO] Se detecto la plantilla publica 'repos.json'.${C_RESET}"
+    echo -e "${C_GRAY}Ejecuta './setup-mac.sh' o 'gitdoctor /catalogo' para escanear y sincronizar tus proyectos reales de GitHub.${C_RESET}\n"
+    exit 0
 fi
 
 # 2. Verificar y clonar repositorios faltantes

@@ -10,32 +10,33 @@ $scriptDir = $PSScriptRoot
 if (-not $scriptDir) { $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition }
 if (-not $scriptDir) { $scriptDir = (Get-Location).Path }
 $syncScript = Join-Path $scriptDir "sync.ps1"
+$localCfgPath = Join-Path $scriptDir "config.local.json"
 
-$parentDir = Split-Path -Parent $scriptDir
-$parentName = Split-Path -Leaf $parentDir
-
-$knownOrgs = @("Personal", "th-mex", "w-amarillo", "w-azul", "w-naranja", "interpec", "w-pluma", "w-ic", "bf-agency", "WeHubs-io")
-
-# REGLA ESTRICTA: GitDoctor reside UNICAMENTE en la raiz de repositorios
-if ($knownOrgs -contains $parentName) {
-    Write-Host "[ERROR] GitDoctor reside dentro de la organizacion '$parentName'." -ForegroundColor Red
-    Write-Host "[REGLA ESTRICTA] GitDoctor debe estar UNICAMENTE en la raiz de tu carpeta de repositorios (ej: D:\Repos\gitdoctor, C:\Proyectos\gitdoctor o la unidad/carpeta que elijas)." -ForegroundColor Yellow
-    Write-Host "Mueve la carpeta 'gitdoctor' a la raiz de tu directorio principal de proyectos para evitar conflictos." -ForegroundColor Yellow
+# Verificar que Python este disponible
+if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
+    Write-Host "[ERROR] Python no esta disponible en el PATH del sistema." -ForegroundColor Red
+    Write-Host "Instalalo con 'winget install Python.Python.3.11' o desde https://python.org (asegurate de marcar 'Add Python to PATH')." -ForegroundColor Yellow
     exit 1
 }
 
-$reposDir = $parentDir
+# En modo interactivo, ejecutar primero el asistente de configuracion completo
+if (-not $Reajuste) {
+    python (Join-Path $scriptDir "onboarding.py") --interactive-setup
+}
 
-# Registrar la carpeta raiz en config.local.json si no fue personalizada antes
-$localCfgPath = Join-Path $scriptDir "config.local.json"
-if (-not (Test-Path $localCfgPath)) {
-    @{ repos_dir = $reposDir; sync_mode = "mirror"; enabled_orgs = @(); disabled_orgs = @() } | ConvertTo-Json -Depth 4 | Out-File -FilePath $localCfgPath -Encoding utf8
-} else {
+# Leer configuracion establecida por el asistente
+$parentDir = Split-Path -Parent $scriptDir
+$reposDir = $parentDir
+$downloadOnSetup = $true
+
+if (Test-Path $localCfgPath) {
     try {
         $cfg = Get-Content $localCfgPath -Raw -Encoding utf8 | ConvertFrom-Json
-        if (-not $cfg.repos_dir) {
-            $cfg | Add-Member -MemberType NoteProperty -Name "repos_dir" -Value $reposDir -Force
-            $cfg | ConvertTo-Json -Depth 4 | Out-File -FilePath $localCfgPath -Encoding utf8
+        if ($cfg.repos_dir -and (Test-Path $cfg.repos_dir)) {
+            $reposDir = $cfg.repos_dir
+        }
+        if ($cfg.download_on_setup -ne $null) {
+            $downloadOnSetup = [bool]$cfg.download_on_setup
         }
     } catch {}
 }
@@ -43,28 +44,14 @@ if (-not (Test-Path $localCfgPath)) {
 if (-not $Reajuste) {
     Write-Host ""
     Write-Host "==========================================================" -ForegroundColor Cyan
-    Write-Host "  GitDoctor -- Suite de Salud y Git para Windows          " -ForegroundColor Cyan
+    Write-Host "  GitDoctor -- Integracion con el Sistema (Windows)       " -ForegroundColor Cyan
     Write-Host "==========================================================" -ForegroundColor Cyan
     Write-Host "  Carpeta raiz de proyectos: $reposDir" -ForegroundColor DarkGray
     Write-Host "  Ubicacion de GitDoctor:    $scriptDir" -ForegroundColor DarkGray
     Write-Host ""
 
-    # 1. Comprobar GitHub CLI
-    Write-Host "[1/5] Verificando estado de GitHub CLI..." -ForegroundColor Yellow
-    if (Get-Command gh -ErrorAction SilentlyContinue) {
-        $ghUser = gh api user --jq .login 2>$null
-        if ($ghUser) {
-            Write-Host "      [OK] GitHub conectado como @$ghUser" -ForegroundColor Green
-            Write-Host "           Boveda Privada disponible: Usa 'gitdoctor /catalogo' para sincronizar tu inventario." -ForegroundColor DarkGray
-        } else {
-            Write-Host "      [INFO] GitHub CLI detectado sin sesion. Usa 'reposync-ai' o 'gh auth login' para iniciar sesion." -ForegroundColor Yellow
-        }
-    } else {
-        Write-Host "      [INFO] GitHub CLI ('gh') no detectado en PATH. Se recomienda instalarlo con 'winget install GitHub.cli'." -ForegroundColor DarkGray
-    }
-
-    # 2. Configurar reglas de Git para evitar conflictos de linea y permisos con Mac
-    Write-Host "[2/5] Configurando parametros de Git y blindando el repo contra ruido..." -ForegroundColor Yellow
+    # 1. Configurar reglas de Git para evitar conflictos de linea y permisos
+    Write-Host "[1/4] Configurando parametros de Git recomendados para Windows..." -ForegroundColor Yellow
 }
 
 git config --global core.autocrlf true 2>$null
@@ -85,28 +72,9 @@ foreach ($legacy in @("_sync", "repos-sync")) {
     }
 }
 
-# Limpiar clones duplicados o mal ubicados de GitDoctor en organizaciones o carpetas legacy
-foreach ($org in $knownOrgs) {
-    $orgDup = Join-Path $reposDir "$org\gitdoctor"
-    if ((Test-Path $orgDup) -and ($orgDup.ToLower() -ne $scriptDir.ToLower())) {
-        Remove-Item -Path $orgDup -Recurse -Force -ErrorAction SilentlyContinue
-    }
-    $orgLegacy = Join-Path $reposDir "$org\repos-sync"
-    if (Test-Path $orgLegacy) {
-        Remove-Item -Path $orgLegacy -Recurse -Force -ErrorAction SilentlyContinue
-    }
-}
-
-foreach ($legacy in @("_gitdoctor", "_sync", "repos-sync")) {
-    $legPath = Join-Path $reposDir $legacy
-    if ((Test-Path $legPath) -and ($legPath.ToLower() -ne $scriptDir.ToLower())) {
-        Remove-Item -Path $legPath -Recurse -Force -ErrorAction SilentlyContinue
-    }
-}
-
-# 3. Configurar comandos globales 'gitdoctor' y 'gitdoc' en el perfil de PowerShell
+# 2. Configurar comandos globales 'gitdoctor' y 'gitdoc' en el perfil de PowerShell
 if (-not $Reajuste) {
-    Write-Host "[3/6] Configurando comandos globales 'gitdoctor' y 'gitdoc' en PowerShell..." -ForegroundColor Yellow
+    Write-Host "[2/4] Configurando comandos globales 'gitdoctor' y 'gitdoc' en PowerShell..." -ForegroundColor Yellow
 }
 
 $profilePath = $PROFILE
@@ -147,7 +115,7 @@ function gitdoctor {
             python (Join-Path `$foundDir "agent.py") `$ArgsList
         }
     } else {
-        Write-Error "No se encontro agent.py en las rutas conocidas de GitDoctor (D:\Repos\gitdoctor)."
+        Write-Error "No se encontro agent.py en las rutas conocidas de GitDoctor ($scriptDir)."
     }
 }
 
@@ -172,9 +140,9 @@ if ($profileContent -match "# >>> (?:RepoSync|GitDoctor) Global (?:Command|Comma
     }
 }
 
-# 4. Crear accesos directos en el Escritorio
+# 3. Crear accesos directos en el Escritorio
 if (-not $Reajuste) {
-    Write-Host "[4/6] Creando accesos directos en el Escritorio..." -ForegroundColor Yellow
+    Write-Host "[3/4] Creando accesos directos en el Escritorio..." -ForegroundColor Yellow
 }
 try {
     $desktopPath = [Environment]::GetFolderPath("Desktop")
@@ -235,15 +203,15 @@ if ($Reajuste) {
     exit 0
 }
 
-# 5. Diagnostico de onboarding y reorganizacion
-Write-Host "[5/6] Verificando estructura de carpetas y diagnostico inicial..." -ForegroundColor Yellow
-if (Get-Command python -ErrorAction SilentlyContinue) {
-    python (Join-Path $scriptDir "onboarding.py")
+# 4. Sincronizacion inicial si fue solicitada
+if ($downloadOnSetup) {
+    Write-Host "`n[*] Procediendo con la sincronizacion y descarga de repositorios faltantes..." -ForegroundColor Yellow
+    powershell -ExecutionPolicy Bypass -File "$syncScript"
+} else {
+    Write-Host "`n[INFO] Modo bajo demanda activo. Tus proyectos estan catalogados en repos.local.json." -ForegroundColor Cyan
+    Write-Host "Para clonar cualquier repositorio cuando lo requieras usa: gitdoctor /clone <nombre>" -ForegroundColor DarkGray
+    Write-Host "O para sincronizar todo en cualquier momento usa:        gitdoctor --sync" -ForegroundColor DarkGray
 }
-
-# 6. Ejecutar primera sincronizacion de prueba
-Write-Host "[6/6] Ejecutando sincronizacion inicial..." -ForegroundColor Yellow
-powershell -ExecutionPolicy Bypass -File "$syncScript"
 
 Write-Host ""
 Write-Host "==========================================================" -ForegroundColor Green

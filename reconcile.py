@@ -33,6 +33,28 @@ def run_cmd(cmd, cwd):
     except Exception:
         return ""
 
+def is_gitdoctor_path(folder_path, script_dir):
+    """Verifica de forma estricta y segura si una ruta es la propia instalacion de GitDoctor"""
+    if not folder_path:
+        return False
+    try:
+        if os.path.isdir(folder_path) and os.path.isdir(script_dir):
+            if os.path.samefile(folder_path, script_dir):
+                return True
+    except Exception:
+        pass
+    try:
+        p1 = os.path.normcase(os.path.realpath(folder_path))
+        s1 = os.path.normcase(os.path.realpath(script_dir))
+        if p1 == s1 or p1.startswith(s1 + os.sep):
+            return True
+        base = os.path.basename(p1).lower()
+        if base in ["gitdoctor", "_gitdoctor", "repos-sync", "_sync"]:
+            return True
+    except Exception:
+        pass
+    return False
+
 def main():
     if hasattr(sys.stdout, 'reconfigure'):
         try:
@@ -41,35 +63,41 @@ def main():
             pass
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    known_orgs = {"Personal", "th-mex", "w-amarillo", "w-azul", "w-naranja", "interpec", "w-pluma", "w-ic", "bf-agency", "WeHubs-io"}
 
     # Resolver catalogo: repos.local.json (si existe) o repos.json
     cat_local = os.path.join(script_dir, "repos.local.json")
     cat_master = os.path.join(script_dir, "repos.json")
     catalog_file = cat_local if os.path.isfile(cat_local) else cat_master
 
+    # Cargar configuracion local si existe
+    cfg_path = os.path.join(script_dir, "config.local.json")
+    local_cfg = {}
+    if os.path.isfile(cfg_path):
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as cf:
+                local_cfg = json.load(cf)
+        except Exception:
+            pass
+
+    # Resolver organizaciones conocidas dinamicamente
+    known_orgs = {"Personal"}
+    if local_cfg.get("enabled_orgs"):
+        known_orgs.update(local_cfg["enabled_orgs"])
+    if local_cfg.get("disabled_orgs"):
+        known_orgs.update(local_cfg["disabled_orgs"])
+
     # Resolver directorio de repositorios (respeta config.local.json si se personalizo)
     repos_dir = None
     if len(sys.argv) > 1 and sys.argv[1]:
         repos_dir = os.path.abspath(sys.argv[1])
+    elif local_cfg.get("repos_dir") and os.path.isdir(local_cfg["repos_dir"]):
+        repos_dir = os.path.abspath(local_cfg["repos_dir"])
     else:
-        cfg_path = os.path.join(script_dir, "config.local.json")
-        if os.path.isfile(cfg_path):
-            try:
-                with open(cfg_path, "r", encoding="utf-8") as cf:
-                    cdata = json.load(cf)
-                    if cdata.get("repos_dir") and os.path.isdir(cdata["repos_dir"]):
-                        repos_dir = os.path.abspath(cdata["repos_dir"])
-            except Exception:
-                pass
-        if not repos_dir:
-            parent = os.path.abspath(os.path.join(script_dir, ".."))
-            # REGLA ESTRICTA: GitDoctor reside UNICAMENTE en la raiz de repositorios
-            if os.path.basename(parent) in known_orgs:
-                print(f"{C_YELLOW}[AVISO] GitDoctor reside dentro de '{os.path.basename(parent)}'. Por regla oficial debe estar unicamente en la raiz de repositorios.{C_RESET}")
-                repos_dir = os.path.abspath(os.path.join(parent, ".."))
-            else:
-                repos_dir = parent
+        parent = os.path.abspath(os.path.join(script_dir, ".."))
+        if os.path.basename(parent) in known_orgs or os.path.basename(parent).lower() in ["personal", "repos-sync"]:
+            repos_dir = os.path.abspath(os.path.join(parent, ".."))
+        else:
+            repos_dir = parent
 
     print(f"\n{C_CYAN}=========================================================={C_RESET}")
     print(f"{C_CYAN}  GitDoctor -- Auditoria y Reconciliacion Clinica         {C_RESET}")
@@ -93,9 +121,9 @@ def main():
     # 1. Escanear repositorios locales (nivel 1 y nivel 2)
     local_repo_paths = []
     for item in sorted(os.listdir(repos_dir)):
-        if item in ["_gitdoctor", "_sync", "gitdoctor", "repos-sync"] or item.startswith('.'):
-            continue
         p1 = os.path.join(repos_dir, item)
+        if is_gitdoctor_path(p1, script_dir) or item.startswith('.'):
+            continue
         if not os.path.isdir(p1):
             continue
 
@@ -104,9 +132,9 @@ def main():
         else:
             try:
                 for sub in sorted(os.listdir(p1)):
-                    if sub.startswith('.'):
-                        continue
                     p2 = os.path.join(p1, sub)
+                    if is_gitdoctor_path(p2, script_dir) or sub.startswith('.'):
+                        continue
                     if os.path.isdir(p2) and os.path.isdir(os.path.join(p2, ".git")):
                         local_repo_paths.append(p2)
             except Exception:
@@ -175,34 +203,12 @@ def main():
     # -------------------------------------------------------------
     print(f"{C_BOLD}--- [2/3] Deteccion de Discrepancias y Reorganizacion ---{C_RESET}")
 
-    # Limpieza automatica de clones duplicados o mal ubicados de GitDoctor
-    dup_candidates = [
-        os.path.join(repos_dir, "_gitdoctor"),
-        os.path.join(repos_dir, "_sync"),
-        os.path.join(repos_dir, "repos-sync"),
-    ]
-    for org in known_orgs:
-        dup_candidates.append(os.path.join(repos_dir, org, "gitdoctor"))
-        dup_candidates.append(os.path.join(repos_dir, org, "repos-sync"))
-
-    for dup in dup_candidates:
-        dup_abs = os.path.abspath(dup)
-        if dup_abs != os.path.abspath(script_dir) and os.path.isdir(dup_abs):
-            if os.path.isfile(os.path.join(dup_abs, "agent.py")):
-                import shutil
-                try:
-                    shutil.rmtree(dup_abs, ignore_errors=True)
-                    rel_cleaned = os.path.relpath(dup_abs, repos_dir)
-                    print(f"  {C_GREEN}[LIMPIEZA] Se elimino el clon mal ubicado/duplicado de GitDoctor en: {rel_cleaned}{C_RESET}")
-                except Exception:
-                    pass
-
     renames_needed = []
     already_matched = set()
 
     for r in inspected_repos:
-        # Excepcion absoluta: GitDoctor es la suite orquestadora y reside unicamente en la raiz
-        if r['folder'] in ['_gitdoctor', 'gitdoctor', '_sync', 'repos-sync'] or os.path.abspath(r['path']) == os.path.abspath(script_dir) or r['norm_remote'].endswith('/gitdoctor') or r['norm_remote'].endswith('/repos-sync'):
+        # Excepcion absoluta: GitDoctor es la suite orquestadora y nunca se modifica
+        if is_gitdoctor_path(r['path'], script_dir) or r['norm_remote'].endswith('/gitdoctor') or r['norm_remote'].endswith('/repos-sync'):
             continue
 
         if r['norm_remote'] in catalog_by_url:
@@ -259,10 +265,9 @@ def main():
     print(f"{C_BOLD}--- [3/3] Resumen de Repositorios Extras y Faltantes ---{C_RESET}")
 
     def is_gitdoctor_repo(r_dict):
-        f = r_dict.get('folder', '')
         p = os.path.abspath(r_dict.get('path', ''))
         nr = r_dict.get('norm_remote', '')
-        return f in ['_gitdoctor', 'gitdoctor', '_sync', 'repos-sync'] or p == os.path.abspath(script_dir) or nr.endswith('/gitdoctor') or nr.endswith('/repos-sync')
+        return is_gitdoctor_path(p, script_dir) or nr.endswith('/gitdoctor') or nr.endswith('/repos-sync')
 
     extras = [r for r in inspected_repos if r['norm_remote'] and (r['norm_remote'] not in catalog_by_url) and not is_gitdoctor_repo(r)]
     if extras:

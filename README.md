@@ -62,9 +62,9 @@ GitDoctor organiza automáticamente el código por **Organización o Grupo**, ga
 
 ---
 
-## ⚡ Instalación Inicial (1-Clic)
+## ⚡ Instalación Inicial Interactiva y Personalizada
 
-Elige la carpeta raíz donde deseas tener tus proyectos (en cualquier unidad o ruta, ej: `D:\Repos`, `C:\Proyectos`, `~/Developer`, `~/Repos`) y clona GitDoctor **directamente en esa raíz**:
+Elige la carpeta raíz donde deseas tener tus proyectos (en cualquier unidad o ruta, ej: `D:\Repos`, `C:\Proyectos`, `~/Developer`, `~/Repos`) y clona GitDoctor **directamente en esa raíz** con el nombre canónico `gitdoctor`:
 
 ### En Windows (PC)
 1. Abre tu terminal (PowerShell o CMD) en tu carpeta de repositorios (ej: `D:\Repos` o `C:\Proyectos`):
@@ -82,7 +82,14 @@ Elige la carpeta raíz donde deseas tener tus proyectos (en cualquier unidad o r
    bash setup-mac.sh
    ```
 
-*(El instalador configurará automáticamente los comandos globales en tu terminal, creará los 5 accesos directos en tu Escritorio y calibrará las rutas de tus repositorios).*
+### 🧙‍♂️ ¿Qué configura el Asistente Interactivo en el primer uso?
+1. **Nombre y Ubicación Canónica:** Define el nombre canónico `gitdoctor` y verifica la ruta de tus repositorios. Blindado contra eliminaciones accidentales.
+2. **Conexión con GitHub:** Conecta con tu cuenta mediante GitHub CLI (`gh`) y descubre automáticamente tus organizaciones y repositorios reales (no asume organizaciones fijas de otros usuarios).
+3. **Alcance de Descarga:** Te permite elegir si descargar **TODO** tu inventario, **solo ciertas organizaciones** (sincronización selectiva por equipo) o **solo catalogar** (descarga bajo demanda con `/clone`).
+4. **Identidad Git:** Configura tu nombre y correo para commits en esta máquina.
+5. **Motor de IA:** Elige entre **Ollama Local Offline** (100% privado, gratis) o **Google Gemini API** (nube ultra-rápida).
+6. **Vigilante en Segundo Plano:** Activa o desactiva las notificaciones de escritorio continuas.
+7. **Integración con el Sistema:** Configura comandos globales (`gitdoctor`, `gitdoc`, `reposync`) en tu terminal y crea los 5 accesos directos en tu Escritorio.
 
 ---
 

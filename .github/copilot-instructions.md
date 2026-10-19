@@ -11,22 +11,25 @@ La estructura de carpetas es **completamente agnóstica de la unidad de disco y 
 * **Estructura en Windows (PC):** `<CarpetaRaiz>\<organizacion>\<nombre-del-repo>`
 * **Estructura en macOS / Linux:** `<CarpetaRaiz>/<organizacion>/<nombre-del-repo>`
 
-### 🩺 Ubicación de GitDoctor (Regla Estricta):
-* GitDoctor (`davidmmora/gitdoctor`) reside **ÚNICA Y EXCLUSIVAMENTE en la raíz designada**:
-  * `<CarpetaRaiz>/gitdoctor` (por ejemplo `D:\Repos\gitdoctor`, `C:\Proyectos\gitdoctor`, `~/Repos/gitdoctor` o `~/Developer/gitdoctor`).
-* **NUNCA** clonar, mover ni ubicar GitDoctor dentro de `Personal` ni de ninguna de las 10 organizaciones. Está fuera de cualquier organización para evitar conflictos de gobernanza, dependencias circulares y duplicados. GitDoctor es el **único** repositorio permitido directamente en la raíz de `<CarpetaRaiz>`.
+### 🩺 Nombre y Ubicación Canónica de GitDoctor:
+* **Nombre oficial de la carpeta:** `gitdoctor` (siempre en minúsculas para evitar colisiones por mayúsculas/minúsculas entre Mac y Windows).
+* **Ubicación canónica recomendada:** Directamente en la raíz de repositorios designada (`<CarpetaRaiz>/gitdoctor`, por ejemplo `D:\Repos\gitdoctor`, `C:\Repos\gitdoctor`, `~/Repos/gitdoctor` o `~/Developer/gitdoctor`).
+* **Blindaje y Protección:** GitDoctor es la suite orquestadora. **NUNCA** debe ser eliminada, movida destructivamente ni tratada como un repositorio de código hijo a clonar o purgar. Si reside dentro de una subcarpeta u organización, el sistema opera con resiliencia total sin abortar.
 
-### 🏢 Las 10 Organizaciones Oficiales (para repositorios de proyectos):
-1. `th-mex`: Proyectos empresariales y sistemas de THMEX.
-2. `w-amarillo`: Proyectos de clientes y marcas (Omron, Festivales, Mabe, Nestlé, etc.).
-3. `w-azul`: Plataformas internas, portales de clientes y sincronizadores.
-4. `w-naranja`: Herramientas de telefonía y tareas (Smartsheets, Vicidial, etc.).
-5. `interpec`: Aplicaciones avícolas y agropecuarias (Sabro, Aliamsa, etc.).
-6. `w-pluma`: Sistemas avícolas (Sabropollo, Sabrohuevo, etc.).
-7. `w-ic`: Servicios de sincronización (IcafSyncService).
-8. `bf-agency`: Proyectos de BF Agency (w-tm).
-9. `WeHubs-io`: Plataforma WeHubs (wehubs, Dixie, insta-photo).
-10. `Personal`: Proyectos personales de David M Mora (`TranscriptAudio`, `pelusa`, `uveg`, etc.).
+### 🏢 Detección Dinámica de Organizaciones:
+* GitDoctor no asume organizaciones fijas para todos los usuarios: se conecta dinámicamente a la cuenta de GitHub mediante `gh` CLI (`gh api user/orgs`) para descubrir las organizaciones y repositorios reales a los que tiene acceso el usuario.
+* En el caso de David M Mora (`davidmmora`), las organizaciones detectadas incluyen:
+  1. `th-mex`: Proyectos empresariales y sistemas de THMEX.
+  2. `w-amarillo`: Proyectos de clientes y marcas (Omron, Festivales, Mabe, Nestlé, etc.).
+  3. `w-azul`: Plataformas internas, portales de clientes y sincronizadores.
+  4. `w-naranja`: Herramientas de telefonía y tareas (Smartsheets, Vicidial, etc.).
+  5. `interpec`: Aplicaciones avícolas y agropecuarias (Sabro, Aliamsa, etc.).
+  6. `w-pluma`: Sistemas avícolas (Sabropollo, Sabrohuevo, etc.).
+  7. `w-ic`: Servicios de sincronización (IcafSyncService).
+  8. `bf-agency`: Proyectos de BF Agency (w-tm).
+  9. `WeHubs-io`: Plataforma WeHubs (wehubs, Dixie, insta-photo).
+  10. `Personal`: Proyectos personales (`TranscriptAudio`, `pelusa`, `uveg`, etc.).
+* Al instalar, el usuario decide si desea descargar todo, seleccionar organizaciones específicas o solo catalogar bajo demanda.
 
 ---
 

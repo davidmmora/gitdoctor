@@ -6,10 +6,9 @@
 set -e
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPOS_DIR="$(cd "$DIR/.." && pwd)"
 
 if [ -n "$1" ]; then
-    REPOS_DIR="$1"
+    python3 "$DIR/reconcile.py" "$1"
+else
+    python3 "$DIR/reconcile.py"
 fi
-
-python3 "$DIR/reconcile.py" "$REPOS_DIR"

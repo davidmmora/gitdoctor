@@ -9,34 +9,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PARENT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PARENT_NAME="$(basename "$PARENT_DIR")"
 
-# REGLA ESTRICTA: GitDoctor reside UNICAMENTE en la raiz de repositorios
-if [[ "$PARENT_NAME" =~ ^(Personal|th-mex|w-amarillo|w-azul|w-naranja|interpec|w-pluma|w-ic|bf-agency|WeHubs-io)$ ]]; then
-    echo -e "\033[31m[ERROR] GitDoctor reside dentro de la organizacion '$PARENT_NAME'.\033[0m"
-    echo -e "\033[33m[REGLA ESTRICTA] GitDoctor debe estar UNICAMENTE en la raiz de tu carpeta de repositorios (ej: ~/Repos/gitdoctor, ~/Developer/gitdoctor o tu carpeta base).\033[0m"
-    echo -e "\033[33mMueve la carpeta 'gitdoctor' a la raiz de tu directorio principal de proyectos para evitar conflictos.\033[0m"
-    exit 1
-fi
-
-REPOS_DIR="$PARENT_DIR"
-
-# Registrar la carpeta raiz en config.local.json si no fue personalizada antes
-LOCAL_CFG="$SCRIPT_DIR/config.local.json"
-if [ ! -f "$LOCAL_CFG" ]; then
-    echo "{\"repos_dir\": \"$REPOS_DIR\", \"sync_mode\": \"mirror\", \"enabled_orgs\": [], \"disabled_orgs\": []}" > "$LOCAL_CFG"
-else
-    python3 -c "
-import json
-path = '$LOCAL_CFG'
-try:
-    d = json.load(open(path))
-    if not d.get('repos_dir'):
-        d['repos_dir'] = '$REPOS_DIR'
-        json.dump(d, open(path, 'w'), indent=4, ensure_ascii=False)
-except Exception:
-    pass
-" 2>/dev/null || true
-fi
-
+# Modo reajuste rapido (silencioso, invocado por sync o launchers)
 REAJUSTE_MODE=false
 if [ "$1" = "--reajuste" ] || [ "$1" = "--quiet" ] || [ "$1" = "-q" ]; then
     REAJUSTE_MODE=true
@@ -49,10 +22,38 @@ C_YELLOW="\033[33m"
 C_WHITE="\033[1;37m"
 C_GRAY="\033[90m"
 
+# Verificar que python3 este disponible
+if ! command -v python3 &>/dev/null; then
+    echo -e "\033[31m[ERROR] python3 no esta instalado en este equipo.\033[0m"
+    echo -e "\033[33mInstalalo con: brew install python3 o descargalo de https://python.org\033[0m"
+    exit 1
+fi
+
+LOCAL_CFG="$SCRIPT_DIR/config.local.json"
+
+# En modo interactivo, ejecutar primero el asistente de configuracion completo
+if [ "$REAJUSTE_MODE" = false ]; then
+    python3 "$SCRIPT_DIR/onboarding.py" --interactive-setup
+fi
+
+# Leer configuracion establecida por el asistente
+REPOS_DIR="$PARENT_DIR"
+DOWNLOAD_ON_SETUP=true
+if [ -f "$LOCAL_CFG" ]; then
+    CFG_REPOS=$(python3 -c "import json; print(json.load(open('$LOCAL_CFG')).get('repos_dir', ''))" 2>/dev/null || true)
+    if [ -n "$CFG_REPOS" ] && [ -d "$CFG_REPOS" ]; then
+        REPOS_DIR="$CFG_REPOS"
+    fi
+    CFG_DL=$(python3 -c "import json; print(json.load(open('$LOCAL_CFG')).get('download_on_setup', True))" 2>/dev/null || true)
+    if [ "$CFG_DL" = "False" ] || [ "$CFG_DL" = "false" ]; then
+        DOWNLOAD_ON_SETUP=false
+    fi
+fi
+
 if [ "$REAJUSTE_MODE" = false ]; then
     echo ""
     echo -e "${C_CYAN}==========================================================${C_RESET}"
-    echo -e "${C_CYAN}  GitDoctor -- Instalador de Suite de Salud y Git (macOS)${C_RESET}"
+    echo -e "${C_CYAN}  GitDoctor -- Integracion con el Sistema (macOS)         ${C_RESET}"
     echo -e "${C_CYAN}==========================================================${C_RESET}"
     echo -e "${C_GRAY}  Carpeta raiz de proyectos: ${C_WHITE}$REPOS_DIR${C_RESET}"
     echo -e "${C_GRAY}  Ubicacion de GitDoctor:    ${C_WHITE}$SCRIPT_DIR${C_RESET}"
@@ -61,7 +62,7 @@ fi
 
 # 1. Asignar permisos de ejecucion a los scripts
 if [ "$REAJUSTE_MODE" = false ]; then
-    echo -e "${C_YELLOW}[1/6] Asignando permisos de ejecucion a los scripts...${C_RESET}"
+    echo -e "${C_YELLOW}[1/4] Asignando permisos de ejecucion a scripts y launchers...${C_RESET}"
 fi
 chmod +x "$SCRIPT_DIR"/*.sh 2>/dev/null || true
 chmod +x "$SCRIPT_DIR"/*.command 2>/dev/null || true
@@ -70,25 +71,9 @@ if [ "$REAJUSTE_MODE" = false ]; then
     echo -e "      ${C_GREEN}[OK] Permisos asignados.${C_RESET}"
 fi
 
-# 2. Verificar GitHub CLI
+# 2. Configurar Git global para macOS y blindar GitDoctor contra ruido de permisos
 if [ "$REAJUSTE_MODE" = false ]; then
-    echo -e "${C_YELLOW}[2/6] Verificando estado de GitHub CLI...${C_RESET}"
-    if command -v gh &>/dev/null; then
-        GH_USER=$(gh api user --jq .login 2>/dev/null || true)
-        if [ -n "$GH_USER" ]; then
-            echo -e "      ${C_GREEN}[OK] GitHub CLI conectado como @$GH_USER${C_RESET}"
-            echo -e "      ${C_GRAY}     Boveda Privada disponible: Usa 'gitdoctor /catalogo' para sincronizar tu inventario.${C_RESET}"
-        else
-            echo -e "      ${C_YELLOW}[INFO] GitHub CLI detectado sin sesion. Usa 'reposync-ai' o 'gh auth login' para iniciar sesion.${C_RESET}"
-        fi
-    else
-        echo -e "      ${C_YELLOW}[INFO] GitHub CLI ('gh') no detectado. Se recomienda instalar con: brew install gh${C_RESET}"
-    fi
-fi
-
-# 3. Configurar Git global para macOS y blindar GitDoctor contra ruido de permisos
-if [ "$REAJUSTE_MODE" = false ]; then
-    echo -e "${C_YELLOW}[3/6] Configurando parametros de Git recomendados para Mac...${C_RESET}"
+    echo -e "${C_YELLOW}[2/4] Configurando parametros de Git recomendados para Mac...${C_RESET}"
 fi
 git config --global core.autocrlf input 2>/dev/null || true
 git -C "$SCRIPT_DIR" config core.filemode false 2>/dev/null || true
@@ -96,31 +81,15 @@ if [ "$REAJUSTE_MODE" = false ]; then
     echo -e "      ${C_GREEN}[OK] Git configurado (core.autocrlf=input, core.filemode=false).${C_RESET}"
 fi
 
-# 4. Configurar comandos globales 'gitdoctor' y 'gitdoc' en el shell (.zshrc / .bashrc)
+# 3. Configurar comandos globales 'gitdoctor' y 'gitdoc' en el shell (.zshrc / .bash_profile)
 if [ "$REAJUSTE_MODE" = false ]; then
-    echo -e "${C_YELLOW}[4/6] Configurando comandos globales 'gitdoctor' y 'gitdoc' en tu terminal...${C_RESET}"
+    echo -e "${C_YELLOW}[3/4] Configurando comandos globales 'gitdoctor' y 'gitdoc' en tu terminal...${C_RESET}"
 fi
 
 # Limpiar enlaces simbolicos viejos o rotos en la raiz de repos
 for legacy in "_sync" "repos-sync"; do
     if [ -L "$REPOS_DIR/$legacy" ]; then
         rm -f "$REPOS_DIR/$legacy" 2>/dev/null || true
-    fi
-done
-
-# Limpiar clones duplicados o mal ubicados de GitDoctor en organizaciones o carpetas legacy
-for org in "Personal" "th-mex" "w-amarillo" "w-azul" "w-naranja" "interpec" "w-pluma" "w-ic" "bf-agency" "WeHubs-io"; do
-    if [ -d "$REPOS_DIR/$org/gitdoctor" ] && [ "$(cd "$REPOS_DIR/$org/gitdoctor" 2>/dev/null && pwd)" != "$SCRIPT_DIR" ]; then
-        rm -rf "$REPOS_DIR/$org/gitdoctor" 2>/dev/null || true
-    fi
-    if [ -d "$REPOS_DIR/$org/repos-sync" ] && [ "$(cd "$REPOS_DIR/$org/repos-sync" 2>/dev/null && pwd)" != "$SCRIPT_DIR" ]; then
-        rm -rf "$REPOS_DIR/$org/repos-sync" 2>/dev/null || true
-    fi
-done
-
-for legacy in "$REPOS_DIR/_gitdoctor" "$REPOS_DIR/_sync" "$REPOS_DIR/repos-sync"; do
-    if [ -d "$legacy" ] && [ "$(cd "$legacy" 2>/dev/null && pwd)" != "$SCRIPT_DIR" ]; then
-        rm -rf "$legacy" 2>/dev/null || true
     fi
 done
 
@@ -180,9 +149,9 @@ if [ "$REAJUSTE_MODE" = false ]; then
     echo -e "      ${C_GREEN}[OK] Comandos globales 'gitdoctor' y 'gitdoc' configurados en tu terminal.${C_RESET}"
 fi
 
-# 5. Crear accesos directos de doble clic en el Escritorio de Mac
+# 4. Crear accesos directos de doble clic en el Escritorio de Mac
 if [ "$REAJUSTE_MODE" = false ]; then
-    echo -e "${C_YELLOW}[5/6] Creando accesos directos en el Escritorio de Mac...${C_RESET}"
+    echo -e "${C_YELLOW}[4/4] Creando accesos directos en el Escritorio de Mac...${C_RESET}"
 fi
 DESKTOP_DIR="$HOME/Desktop"
 if [ -d "$DESKTOP_DIR" ]; then
@@ -236,17 +205,23 @@ if [ "$REAJUSTE_MODE" = true ]; then
     exit 0
 fi
 
-# 6. Diagnostico de onboarding, auditoria de seguridad y reconciliacion
-echo -e "${C_YELLOW}[6/6] Verificando estructura de carpetas y ejecutando auditoria...${C_RESET}"
-python3 "$SCRIPT_DIR/onboarding.py" "$REPOS_DIR" || true
+# 5. Auditoria de seguridad y reconciliacion
+echo -e "\n${C_YELLOW}[*] Ejecutando reconciliacion de carpetas...${C_RESET}"
 python3 "$SCRIPT_DIR/reconcile.py" "$REPOS_DIR"
 
-echo -e "\n${C_YELLOW}[*] Procediendo con la sincronizacion y descarga de repositorios faltantes...${C_RESET}"
-"$SCRIPT_DIR/sync.sh"
+# 6. Sincronizacion inicial si fue solicitada en la instalacion
+if [ "$DOWNLOAD_ON_SETUP" = true ]; then
+    echo -e "\n${C_YELLOW}[*] Procediendo con la sincronizacion y descarga de repositorios faltantes...${C_RESET}"
+    "$SCRIPT_DIR/sync.sh"
+else
+    echo -e "\n${C_CYAN}[INFO] Modo bajo demanda activo. Tus proyectos estan catalogados en repos.local.json.${C_RESET}"
+    echo -e "${C_GRAY}Para clonar cualquier repositorio cuando lo requieras usa: gitdoctor /clone <nombre>${C_RESET}"
+    echo -e "${C_GRAY}O para sincronizar todo en cualquier momento usa:        gitdoctor --sync${C_RESET}"
+fi
 
 echo ""
 echo -e "${C_GREEN}==========================================================${C_RESET}"
-echo -e "${C_GREEN}  ¡Instalacion completada con exito en tu Mac!${C_RESET}"
+echo -e "${C_GREEN}  ¡Instalacion de GitDoctor completada con exito en tu Mac!${C_RESET}"
 echo -e "${C_WHITE}  A partir de ahora usa 'gitdoctor' (o 'gitdoc') en tu${C_RESET}"
 echo -e "${C_WHITE}  terminal para tener todo diagnosticado y al dia.${C_RESET}"
 echo -e "${C_GREEN}==========================================================${C_RESET}"

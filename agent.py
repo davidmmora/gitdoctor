@@ -104,6 +104,28 @@ COPILOT_TRAILER = "Co-authored-by: Copilot <223556219+Copilot@users.noreply.gith
 # ==============================================================================
 # UTILIDADES GIT Y RUTAS
 # ==============================================================================
+def is_gitdoctor_path(folder_path, script_dir):
+    """Verifica de forma estricta y segura si una ruta es la propia instalacion de GitDoctor"""
+    if not folder_path:
+        return False
+    try:
+        if os.path.isdir(folder_path) and os.path.isdir(script_dir):
+            if os.path.samefile(folder_path, script_dir):
+                return True
+    except Exception:
+        pass
+    try:
+        p1 = os.path.normcase(os.path.realpath(folder_path))
+        s1 = os.path.normcase(os.path.realpath(script_dir))
+        if p1 == s1 or p1.startswith(s1 + os.sep):
+            return True
+        base = os.path.basename(p1).lower()
+        if base in ["gitdoctor", "_gitdoctor", "repos-sync", "_sync"]:
+            return True
+    except Exception:
+        pass
+    return False
+
 def normalize_url(url):
     if not url:
         return ""
@@ -751,25 +773,42 @@ def get_active_orgs(repos_dir, gh_info=None):
     """
     Determina dinamicamente las organizaciones activas combinando:
     1. Organizaciones de GitHub del usuario actual
-    2. Carpetas locales en repos_dir (que no sean _sync ni ocultas)
-    3. 'Personal' y las 10 organizaciones oficiales por defecto
+    2. Organizaciones configuradas en config.local.json
+    3. Carpetas locales en repos_dir (que no sean gitdoctor ni ocultas)
+    4. 'Personal' y fallbacks conocidos
     """
-    orgs = set(DEFAULT_ORGS)
+    orgs = set()
     if gh_info and gh_info.get('orgs'):
         orgs.update(gh_info['orgs'])
+
+    # Leer organizaciones desde config.local.json si existen
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    try:
+        cfg = load_local_config(script_dir)
+        if cfg.get("enabled_orgs"):
+            orgs.update(cfg["enabled_orgs"])
+        if cfg.get("disabled_orgs"):
+            orgs.update(cfg["disabled_orgs"])
+    except Exception:
+        pass
 
     try:
         if os.path.isdir(repos_dir):
             for item in os.listdir(repos_dir):
-                if item in ['_gitdoctor', '_sync', 'gitdoctor', 'repos-sync'] or item.startswith('.'):
-                    continue
                 p = os.path.join(repos_dir, item)
+                if is_gitdoctor_path(p, script_dir) or item.startswith('.'):
+                    continue
                 if os.path.isdir(p):
                     orgs.add(item)
     except Exception:
         pass
 
     orgs.add("Personal")
+
+    # Si la lista esta vacia (sin gh ni carpetas), sugerir las oficiales de fallback
+    if len(orgs) <= 1:
+        orgs.update(DEFAULT_ORGS)
+
     return sorted(list(orgs))
 
 # ==============================================================================
@@ -2902,6 +2941,8 @@ def import_repos_from_github(script_dir, gh_info):
         if res.returncode == 0:
             user_repos = json.loads(res.stdout.decode('utf-8'))
             for r in user_repos:
+                if r["name"].lower() in ["gitdoctor", "repos-sync"] or r.get("url", "").endswith("/gitdoctor.git"):
+                    continue
                 b = r.get("defaultBranchRef", {}).get("name") if r.get("defaultBranchRef") else "main"
                 entries.append({
                     "name": r["name"],
@@ -2922,6 +2963,8 @@ def import_repos_from_github(script_dir, gh_info):
             if res.returncode == 0:
                 org_repos = json.loads(res.stdout.decode('utf-8'))
                 for r in org_repos:
+                    if r["name"].lower() in ["gitdoctor", "repos-sync"] or r.get("url", "").endswith("/gitdoctor.git"):
+                        continue
                     b = r.get("defaultBranchRef", {}).get("name") if r.get("defaultBranchRef") else "main"
                     entries.append({
                         "name": r["name"],
@@ -2947,16 +2990,23 @@ def import_repos_from_github(script_dir, gh_info):
     return {"success": True, "count": len(entries)}
 
 def resolve_repos_dir(script_dir, local_cfg=None):
-    """Resuelve la carpeta raiz de repositorios (GitDoctor reside estrictamente en la raiz de repos)"""
+    """Resuelve la carpeta raiz de repositorios con resiliencia y compatibilidad"""
     if local_cfg and local_cfg.get("repos_dir"):
         c_dir = local_cfg["repos_dir"].strip()
         if c_dir and os.path.isdir(c_dir):
             return os.path.abspath(c_dir)
 
     parent = os.path.abspath(os.path.join(script_dir, ".."))
-    known_orgs = {"Personal", "th-mex", "w-amarillo", "w-azul", "w-naranja", "interpec", "w-pluma", "w-ic", "bf-agency", "WeHubs-io"}
-    # REGLA ESTRICTA: GitDoctor reside UNICAMENTE en la raiz de repositorios
-    if os.path.basename(parent) in known_orgs:
+    parent_name = os.path.basename(parent)
+    known_orgs = set(DEFAULT_ORGS)
+    if local_cfg:
+        if local_cfg.get("enabled_orgs"):
+            known_orgs.update(local_cfg["enabled_orgs"])
+        if local_cfg.get("disabled_orgs"):
+            known_orgs.update(local_cfg["disabled_orgs"])
+
+    # Si GitDoctor fue clonado dentro de una organizacion (ej: Personal/gitdoctor), la raiz es el directorio superior
+    if parent_name in known_orgs or parent_name.lower() in ["personal", "repos-sync"]:
         return os.path.abspath(os.path.join(parent, ".."))
     return parent
 
@@ -3597,24 +3647,6 @@ def main():
 
     # Directorio raiz de repositorios (personalizable por maquina en config.local.json)
     repos_dir = resolve_repos_dir(script_dir, local_cfg)
-
-    # Limpieza silenciosa de clones duplicados o redundantes de GitDoctor
-    for dup in [
-        os.path.join(repos_dir, "_gitdoctor"),
-        os.path.join(repos_dir, "gitdoctor"),
-        os.path.join(repos_dir, "_sync"),
-        os.path.join(repos_dir, "repos-sync"),
-        os.path.join(repos_dir, "Personal", "gitdoctor"),
-        os.path.join(repos_dir, "Personal", "repos-sync")
-    ]:
-        dup_abs = os.path.abspath(dup)
-        if dup_abs != os.path.abspath(script_dir) and os.path.isdir(dup_abs):
-            if os.path.isfile(os.path.join(dup_abs, "agent.py")):
-                import shutil
-                try:
-                    shutil.rmtree(dup_abs, ignore_errors=True)
-                except Exception:
-                    pass
 
     # Cargar catalogo: repos.local.json privado (si existe) o repos.json maestro
     cat_local = os.path.join(script_dir, "repos.local.json")
