@@ -1,0 +1,41 @@
+# macOS metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Windows metadata & shell
+Thumbs.db
+ehthumbs.db
+desktop.ini
+*.lnk
+$RECYCLE.BIN/
+
+# Editor & IDE artifacts (VS Code, Visual Studio, JetBrains)
+.vscode/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.swp
+*.bak
+*~
+~$*
+
+# Temporales y caches locales
+*.tmp
+*.log
+__pycache__/
+*.pyc
+*.pyo
+
+# Claves privadas y configuraciones por maquina
+.env
+*.env
+config.local.json
+*.local.json
+repos.local.json
+

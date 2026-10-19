@@ -1,0 +1,23 @@
+[
+    {
+        "name": "mi-proyecto-backend",
+        "group": "mi-organizacion",
+        "path": "mi-organizacion/mi-proyecto-backend",
+        "url": "https://github.com/mi-organizacion/mi-proyecto-backend.git",
+        "defaultBranch": "main"
+    },
+    {
+        "name": "mi-proyecto-frontend",
+        "group": "mi-organizacion",
+        "path": "mi-organizacion/mi-proyecto-frontend",
+        "url": "https://github.com/mi-organizacion/mi-proyecto-frontend.git",
+        "defaultBranch": "main"
+    },
+    {
+        "name": "mi-libreria-utilidades",
+        "group": "Personal",
+        "path": "Personal/mi-libreria-utilidades",
+        "url": "https://github.com/mi-usuario/mi-libreria-utilidades.git",
+        "defaultBranch": "main"
+    }
+]
