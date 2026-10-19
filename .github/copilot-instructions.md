@@ -20,15 +20,15 @@ La estructura de carpetas es **completamente agnóstica de la unidad de disco y 
 * GitDoctor no asume organizaciones fijas para todos los usuarios: se conecta dinámicamente a la cuenta de GitHub mediante `gh` CLI (`gh api user/orgs`) para descubrir las organizaciones y repositorios reales a los que tiene acceso el usuario.
 * En el caso de David M Mora (`davidmmora`), las organizaciones detectadas incluyen:
   1. `th-mex`: Proyectos empresariales y sistemas de THMEX.
-  2. `w-amarillo`: Proyectos de clientes y marcas (Omron, Festivales, Mabe, Nestlé, etc.).
-  3. `w-azul`: Plataformas internas, portales de clientes y sincronizadores.
-  4. `w-naranja`: Herramientas de telefonía y tareas (Smartsheets, Vicidial, etc.).
-  5. `interpec`: Aplicaciones avícolas y agropecuarias (Sabro, Aliamsa, etc.).
-  6. `w-pluma`: Sistemas avícolas (Sabropollo, Sabrohuevo, etc.).
-  7. `w-ic`: Servicios de sincronización (IcafSyncService).
-  8. `bf-agency`: Proyectos de BF Agency (w-tm).
-  9. `WeHubs-io`: Plataforma WeHubs (wehubs, Dixie, insta-photo).
-  10. `Personal`: Proyectos personales (`TranscriptAudio`, `pelusa`, `uveg`, etc.).
+  2. `w-amarillo`: Proyectos de clientes y desarrollo web.
+  3. `w-azul`: Plataformas internas y portales de clientes.
+  4. `w-naranja`: Herramientas de telefonía y tareas.
+  5. `interpec`: Aplicaciones agropecuarias.
+  6. `w-pluma`: Sistemas avícolas.
+  7. `w-ic`: Servicios de sincronización de datos.
+  8. `bf-agency`: Proyectos de agencia.
+  9. `WeHubs-io`: Plataforma WeHubs.
+  10. `Personal`: Proyectos personales y librerías de código abierto.
 * Al instalar, el usuario decide si desea descargar todo, seleccionar organizaciones específicas o solo catalogar bajo demanda.
 
 ---

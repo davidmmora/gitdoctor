@@ -812,10 +812,390 @@ def get_active_orgs(repos_dir, gh_info=None):
     return sorted(list(orgs))
 
 # ==============================================================================
+# MOTOR DE BUSQUEDA INTELIGENTE, COINCIDENCIA DIFUSA Y CATALOGO DE REPOSITORIOS
+# ==============================================================================
+def split_words(s):
+    """Divide cadenas en palabras considerando snake_case, kebab-case y CamelCase"""
+    if not s:
+        return []
+    s = s.replace('-', ' ').replace('_', ' ')
+    words = re.findall(r'[A-Z]?[a-z]+|[A-Z]+(?=[A-Z][a-z]|\d|\W|$)|\d+', s)
+    return [w.lower() for w in words] if words else [s.lower()]
+
+def find_matching_repos(query, catalog, repos_dir=None, cutoff=0.50):
+    """
+    Motor de Busqueda Inteligente y Coincidencia Difusa (Fuzzy Search) para Repositorios.
+    Tolera:
+    - Faltas de ortografia y typos (ej: 'peluza' -> 'pelusa', 'trascript' -> 'TranscriptAudio')
+    - Diferencias de mayusculas/minusculas, guiones y espacios (ej: 'web-api-net' -> 'WebApiNet')
+    - Nombres parciales o palabras clave (ej: 'audio' -> 'TranscriptAudio', 'moodboard' -> 'moodboard-homesweethome')
+    - Busqueda en catalogo y en carpetas locales en disco
+
+    Devuelve lista de dicts ordenados por relevancia:
+    [{'entry': {...}, 'score': float, 'match_type': str, 'is_cloned': bool}, ...]
+    """
+    if not query:
+        return []
+
+    q_clean = query.strip().lower().rstrip('/').replace('.git', '')
+    if q_clean.startswith("./"):
+        q_clean = q_clean[2:]
+    if q_clean.startswith("repo:"):
+        q_clean = q_clean[5:].strip()
+
+    q_alnum = re.sub(r'[^a-z0-9]', '', q_clean)
+    q_words = split_words(query)
+
+    # Construir conjunto de repositorios (catalogo + carpetas fisicas no catalogadas)
+    pool = []
+    seen_names = set()
+
+    for item in catalog:
+        name = item.get("name", "")
+        if name:
+            seen_names.add(name.lower())
+            pool.append(dict(item))
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    if repos_dir and os.path.isdir(repos_dir):
+        try:
+            for item in sorted(os.listdir(repos_dir)):
+                p1 = os.path.join(repos_dir, item)
+                if is_gitdoctor_path(p1, script_dir) or item.startswith('.'):
+                    continue
+                if not os.path.isdir(p1):
+                    continue
+                if os.path.isdir(os.path.join(p1, ".git")):
+                    if item.lower() not in seen_names:
+                        seen_names.add(item.lower())
+                        pool.append({
+                            "name": item,
+                            "group": "Personal",
+                            "path": f"Personal/{item}",
+                            "url": run_cmd(['git', 'remote', 'get-url', 'origin'], cwd=p1) or "",
+                            "defaultBranch": "main"
+                        })
+                else:
+                    for sub in sorted(os.listdir(p1)):
+                        if sub.startswith('.'):
+                            continue
+                        p2 = os.path.join(p1, sub)
+                        if os.path.isdir(p2) and os.path.isdir(os.path.join(p2, ".git")):
+                            if sub.lower() not in seen_names:
+                                seen_names.add(sub.lower())
+                                pool.append({
+                                    "name": sub,
+                                    "group": item,
+                                    "path": f"{item}/{sub}",
+                                    "url": run_cmd(['git', 'remote', 'get-url', 'origin'], cwd=p2) or "",
+                                    "defaultBranch": "main"
+                                })
+        except Exception:
+            pass
+
+    results = []
+    for entry in pool:
+        name = entry.get('name', '')
+        group = entry.get('group', '')
+        path = entry.get('path', f"{group}/{name}")
+        n_lower = name.lower()
+        n_alnum = re.sub(r'[^a-z0-9]', '', n_lower)
+        p_lower = path.lower()
+        p_alnum = re.sub(r'[^a-z0-9]', '', p_lower)
+        n_words = split_words(name)
+
+        score = 0.0
+        match_type = 'none'
+
+        # 1. Coincidencia exacta de nombre o ruta
+        if q_clean == n_lower or q_clean == p_lower:
+            score = 1.0
+            match_type = 'exact'
+        # 2. Coincidencia alfanumerica exacta (ignora guiones, mayusculas, espacios)
+        elif q_alnum and (q_alnum == n_alnum or q_alnum == p_alnum):
+            score = 0.98
+            match_type = 'alnum'
+        # 3. Prefijo alfanumerico (ej: "webapi" en "WebApiNet")
+        elif q_alnum and n_alnum.startswith(q_alnum) and len(q_alnum) >= 3:
+            score = 0.94
+            match_type = 'prefix'
+        # 4. Subcadena alfanumerica directa
+        elif q_alnum and q_alnum in n_alnum and len(q_alnum) >= 3:
+            score = 0.90
+            match_type = 'substring'
+        # 5. Coincidencia de palabras (tokens)
+        elif any(qw in nw for qw in q_words for nw in n_words if len(qw) >= 3):
+            score = 0.88
+            match_type = 'word_match'
+        # 6. Subcadena en ruta completa
+        elif q_clean in p_lower and len(q_clean) >= 3:
+            score = 0.85
+            match_type = 'substring_path'
+        else:
+            # 7. Coincidencia difusa (fuzzy ratio) con difflib
+            r_name = difflib.SequenceMatcher(None, q_clean, n_lower).ratio()
+            r_alnum = difflib.SequenceMatcher(None, q_alnum, n_alnum).ratio() if (q_alnum and n_alnum) else 0.0
+            r_parts = max([difflib.SequenceMatcher(None, q_clean, part).ratio() for part in n_words]) if n_words else 0.0
+            best_r = max(r_name, r_alnum, r_parts)
+            if best_r >= cutoff:
+                score = round(best_r, 3)
+                match_type = 'fuzzy'
+
+        if score >= cutoff:
+            is_cloned = False
+            if repos_dir:
+                rel = path.replace('/', os.sep)
+                full = os.path.join(repos_dir, rel)
+                is_cloned = os.path.isdir(os.path.join(full, ".git"))
+            results.append({
+                "entry": entry,
+                "score": score,
+                "match_type": match_type,
+                "is_cloned": is_cloned
+            })
+
+    results.sort(key=lambda x: x['score'], reverse=True)
+    return results
+
+def find_matching_org(query, known_orgs, cutoff=0.85):
+    """Busca una organizacion con tolerancia a mayusculas, guiones y faltas de ortografia"""
+    if not query:
+        return None
+    q = query.strip().lower()
+    q_alnum = re.sub(r'[^a-z0-9]', '', q)
+
+    for o in known_orgs:
+        if o.lower() == q or re.sub(r'[^a-z0-9]', '', o.lower()) == q_alnum:
+            return o
+
+    # Fuzzy match con umbral alto para no confundir nombres de repos con organizaciones
+    if len(q) >= 4:
+        close = difflib.get_close_matches(q, [o.lower() for o in known_orgs], n=1, cutoff=cutoff)
+        if close:
+            for o in known_orgs:
+                if o.lower() == close[0]:
+                    return o
+    return None
+
+def print_repos_catalog_table(repo_items, filter_desc=""):
+    """Imprime una tabla clinica y visual del catalogo de repositorios"""
+    print(f"\n{C_CYAN}=================================================================================={C_RESET}")
+    print(f"{C_WHITE}{C_BOLD}  📁 Catálogo de Repositorios de Desarrollo ({len(repo_items)} encontrados)           {C_RESET}")
+    if filter_desc:
+        print(f"  {C_GRAY}Filtro aplicado: '{filter_desc}'{C_RESET}")
+    print(f"{C_CYAN}=================================================================================={C_RESET}")
+
+    if not repo_items:
+        print(f"\n  {C_YELLOW}[!] No se encontraron repositorios con el criterio especificado.{C_RESET}")
+        print(f"  {C_GRAY}Tip: Escribe {C_WHITE}/repos{C_GRAY} para ver todos o {C_WHITE}/buscar <termino>{C_GRAY} para buscar con tolerancia a faltas.{C_RESET}\n")
+        return
+
+    by_org = {}
+    for r in repo_items:
+        by_org.setdefault(r["group"], []).append(r)
+
+    total_cloned = sum(1 for r in repo_items if r["is_cloned"])
+    total_uncloned = len(repo_items) - total_cloned
+
+    for org, r_list in sorted(by_org.items()):
+        cloned_in_org = sum(1 for r in r_list if r["is_cloned"])
+        uncloned_in_org = len(r_list) - cloned_in_org
+        stats_str = f"{cloned_in_org} clonados" if uncloned_in_org == 0 else f"{cloned_in_org} clonados, {uncloned_in_org} en nube"
+        print(f"\n{C_BOLD}{C_CYAN}🏢 [{org}]{C_RESET} {C_GRAY}({len(r_list)} repos: {stats_str}){C_RESET}")
+
+        for idx, r in enumerate(sorted(r_list, key=lambda x: x["name"].lower()), 1):
+            if r["is_cloned"]:
+                status_str = f"{C_GREEN}[✓ Clonado]{C_RESET}"
+                dirty_str = f" {C_YELLOW}(cambios locales){C_RESET}" if r["is_dirty"] else ""
+                branch_str = f" {C_CYAN}(rama: {r['branch']}){C_RESET}"
+            else:
+                status_str = f"{C_YELLOW}[☁ En nube]{C_RESET}"
+                dirty_str = ""
+                branch_str = f" {C_GRAY}(default: {r['defaultBranch']}){C_RESET}"
+
+            print(f"  {idx:2d}. {C_WHITE}{r['name']:<28}{C_RESET} {status_str}{branch_str}{dirty_str}")
+
+    print(f"\n{C_CYAN}----------------------------------------------------------------------------------{C_RESET}")
+    print(f"  * Total: {C_BOLD}{len(repo_items)} repositorios{C_RESET} ({C_GREEN}{total_cloned} clonados en este equipo{C_RESET}, {C_YELLOW}{total_uncloned} disponibles en GitHub{C_RESET})")
+    print(f"  * {C_GRAY}Comandos directos:{C_RESET} {C_WHITE}/code <nombre>{C_RESET} para abrir en VS Code | {C_WHITE}/clone <nombre>{C_RESET} para descargar | {C_WHITE}/buscar <texto>{C_RESET} para buscar difuso")
+    print("")
+
+def list_repositories(repos_dir, catalog, query="", org_name="", status_filter="all", interactive=True):
+    """
+    Lista y filtra los repositorios del catalogo y disco con estado detallado.
+    - Soporta filtro por termino/query (con tolerancia a faltas de ortografia).
+    - Soporta filtro por organizacion y por estado (cloned / uncloned / all).
+    - Devuelve dict estructurado y muestra en pantalla de forma atractiva.
+    """
+    q = (query or "").strip()
+    org = (org_name or "").strip()
+
+    # Si query contiene modificadores de estado
+    if "--nube" in q.lower() or "--cloud" in q.lower() or "--faltantes" in q.lower() or "--disponibles" in q.lower():
+        status_filter = "uncloned"
+        q = re.sub(r'--(nube|cloud|faltantes|disponibles)', '', q, flags=re.I).strip()
+    elif "--clonados" in q.lower() or "--local" in q.lower():
+        status_filter = "cloned"
+        q = re.sub(r'--(clonados|local)', '', q, flags=re.I).strip()
+
+    # Si se paso un query pero no org, verificar si el query es una organizacion
+    if q and not org:
+        all_orgs = get_active_orgs(repos_dir)
+        repo_names = {c['name'].lower() for c in catalog}
+        q_alnum = re.sub(r'[^a-z0-9]', '', q.lower())
+        matched_o = None
+        for o in all_orgs:
+            if o.lower() == q.lower() or re.sub(r'[^a-z0-9]', '', o.lower()) == q_alnum:
+                matched_o = o
+                break
+        # Solo considerarlo filtro de org si coincide con una org y no es el nombre exacto de un repo
+        if matched_o and q.lower() not in repo_names:
+            org = matched_o
+            q = ""
+
+    # Obtener candidatos
+    candidates = []
+    if q:
+        matches = find_matching_repos(q, catalog, repos_dir=repos_dir, cutoff=0.45)
+        candidates = [m["entry"] for m in matches]
+    else:
+        candidates = list(catalog)
+        # Agregar repos descubiertos fisicamente en disco que no esten en catalog
+        known_names = {c["name"].lower() for c in catalog}
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        if repos_dir and os.path.isdir(repos_dir):
+            try:
+                for item in sorted(os.listdir(repos_dir)):
+                    p1 = os.path.join(repos_dir, item)
+                    if is_gitdoctor_path(p1, script_dir) or item.startswith('.'):
+                        continue
+                    if not os.path.isdir(p1):
+                        continue
+                    if os.path.isdir(os.path.join(p1, ".git")):
+                        if item.lower() not in known_names:
+                            known_names.add(item.lower())
+                            candidates.append({
+                                "name": item, "group": "Personal", "path": f"Personal/{item}",
+                                "url": run_cmd(['git', 'remote', 'get-url', 'origin'], cwd=p1) or "",
+                                "defaultBranch": "main"
+                            })
+                    else:
+                        for sub in sorted(os.listdir(p1)):
+                            if sub.startswith('.'):
+                                continue
+                            p2 = os.path.join(p1, sub)
+                            if os.path.isdir(p2) and os.path.isdir(os.path.join(p2, ".git")):
+                                if sub.lower() not in known_names:
+                                    known_names.add(sub.lower())
+                                    candidates.append({
+                                        "name": sub, "group": item, "path": f"{item}/{sub}",
+                                        "url": run_cmd(['git', 'remote', 'get-url', 'origin'], cwd=p2) or "",
+                                        "defaultBranch": "main"
+                                    })
+            except Exception:
+                pass
+
+    if org:
+        candidates = [
+            c for c in candidates
+            if c.get("group", "").lower() == org.lower()
+            or re.sub(r'[^a-z0-9]', '', c.get("group", "").lower()) == re.sub(r'[^a-z0-9]', '', org.lower())
+        ]
+
+    repo_items = []
+    for entry in candidates:
+        name = entry["name"]
+        grp = entry.get("group", "Otros")
+        rel_path = entry.get("path", f"{grp}/{name}").replace("/", os.sep)
+        full_path = os.path.join(repos_dir, rel_path)
+        git_dir = os.path.join(full_path, ".git")
+        is_cloned = os.path.isdir(git_dir)
+        branch = "-"
+        is_dirty = False
+
+        if is_cloned:
+            b = run_cmd(["git", "branch", "--show-current"], cwd=full_path)
+            branch = b if b else run_cmd(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=full_path) or entry.get("defaultBranch", "main")
+            st = run_cmd(["git", "status", "--porcelain"], cwd=full_path)
+            is_dirty = bool(st)
+
+        if status_filter == "cloned" and not is_cloned:
+            continue
+        if status_filter in ["uncloned", "nube"] and is_cloned:
+            continue
+
+        repo_items.append({
+            "name": name,
+            "group": grp,
+            "path": rel_path,
+            "full_path": full_path,
+            "is_cloned": is_cloned,
+            "branch": branch,
+            "is_dirty": is_dirty,
+            "url": entry.get("url", ""),
+            "defaultBranch": entry.get("defaultBranch", "main")
+        })
+
+    filter_desc = q if q else (f"Organizacion: {org}" if org else "")
+    if status_filter != "all":
+        filter_desc = f"{filter_desc} (solo {status_filter})".strip()
+
+    if interactive:
+        print_repos_catalog_table(repo_items, filter_desc=filter_desc)
+
+    return {
+        "total": len(repo_items),
+        "cloned_count": len([r for r in repo_items if r["is_cloned"]]),
+        "uncloned_count": len([r for r in repo_items if not r["is_cloned"]]),
+        "repositories": repo_items
+    }
+
+def search_repositories_cli(repos_dir, catalog, query):
+    """Buscador interactivo de repositorios con tolerancia a errores tipograficos (fuzzy search)"""
+    if not query:
+        print(f"\n{C_YELLOW}[?] No indicaste el termino a buscar.{C_RESET}")
+        try:
+            query = input(f"{C_BOLD}Nombre o termino a buscar: {C_RESET}").strip()
+        except EOFError:
+            query = ""
+        if not query:
+            return {"matches": []}
+
+    matches = find_matching_repos(query, catalog, repos_dir=repos_dir, cutoff=0.45)
+    print(f"\n{C_CYAN}=================================================================================={C_RESET}")
+    print(f"{C_WHITE}{C_BOLD}  🔍 Resultados de búsqueda difusa para: '{query}' ({len(matches)} encontrados)     {C_RESET}")
+    print(f"{C_CYAN}=================================================================================={C_RESET}")
+
+    if not matches:
+        print(f"\n  {C_RED}[!] No se encontraron repositorios similares a '{query}'.{C_RESET}")
+        print(f"  {C_GRAY}Tip: Escribe {C_WHITE}/repos{C_GRAY} para ver el catalogo completo.{C_RESET}\n")
+        return {"matches": []}
+
+    display_candidates = matches[:10]
+    for idx, m in enumerate(display_candidates, 1):
+        e = m["entry"]
+        pct = int(m["score"] * 100)
+        status_tag = f"{C_GREEN}[✓ Clonado]{C_RESET}" if m.get("is_cloned") else f"{C_YELLOW}[☁ En nube]{C_RESET}"
+        match_label = f"{C_GREEN}Exacta (100%){C_RESET}" if m["match_type"] == "exact" else f"{C_CYAN}{m['match_type']} ({pct}%){C_RESET}"
+        print(f"  [{idx:2d}] {C_BOLD}{e.get('group', 'Personal')}/{e['name']:<26}{C_RESET} {status_tag} {match_label}")
+
+    print(f"\n{C_GRAY}Opciones: Escribe el numero [1-{len(display_candidates)}] para abrir en VS Code, o presiona Enter para salir.{C_RESET}")
+    try:
+        ans = input(f"{C_BOLD}Abrir en VS Code > {C_RESET}").strip()
+    except EOFError:
+        ans = ""
+
+    if ans.isdigit() and 1 <= int(ans) <= len(display_candidates):
+        chosen = display_candidates[int(ans) - 1]["entry"]
+        open_repo_in_vscode(repos_dir, catalog, chosen["name"])
+    print("")
+    return {"matches": [m["entry"] for m in matches]}
+
+# ==============================================================================
 # INTEGRACION CON VISUAL STUDIO CODE (/code <repo>)
 # ==============================================================================
 def open_repo_in_vscode(repos_dir, catalog, query):
-    """Busca un repositorio por nombre o coincidencia difusa y lo abre en VS Code"""
+    """Busca un repositorio por nombre o coincidencia difusa (fuzzy search) y lo abre en VS Code"""
     if not query:
         print(f"\n{C_YELLOW}[?] No indicaste el repositorio a abrir.{C_RESET}")
         try:
@@ -826,51 +1206,50 @@ def open_repo_in_vscode(repos_dir, catalog, query):
             print(f"{C_GRAY}Operacion cancelada.{C_RESET}\n")
             return {"success": False, "error": "No query provided"}
 
-    q = query.strip().lower()
-    matches = []
-
-    for entry in catalog:
-        name = entry['name'].lower()
-        grp = entry.get('group', '').lower()
-        path = entry.get('path', '').lower()
-        if q == name or q == path or q in name or q in grp:
-            matches.append(entry)
+    matches = find_matching_repos(query, catalog, repos_dir=repos_dir, cutoff=0.50)
 
     if not matches:
-        # Buscar en carpetas fisicas si no esta en catalog
-        try:
-            for root, dirs, files in os.walk(repos_dir):
-                if ".git" in dirs:
-                    dirs.clear()
-                    bname = os.path.basename(root).lower()
-                    if q in bname:
-                        rel = os.path.relpath(root, repos_dir)
-                        matches.append({"name": os.path.basename(root), "path": rel, "group": os.path.dirname(rel)})
-        except Exception:
-            pass
-
-    if not matches:
-        print(f"\n{C_RED}[!] No se encontro ningun repositorio que coincida con '{query}'.{C_RESET}\n")
+        print(f"\n{C_RED}[!] No se encontro ningun repositorio que coincida con '{query}'.{C_RESET}")
+        print(f"{C_GRAY}Tip: Escribe {C_WHITE}/repos{C_GRAY} para ver el catalogo completo o {C_WHITE}/buscar <termino>{C_GRAY} para buscar.{C_RESET}\n")
         return {"success": False, "error": "Repo not found"}
 
     target = None
-    if len(matches) == 1:
-        target = matches[0]
-    else:
-        # Coincidencia exacta de nombre
-        exact = [m for m in matches if m['name'].lower() == q]
-        if len(exact) == 1:
-            target = exact[0]
+    top = matches[0]
+
+    # 1. Coincidencia exacta o perfecta (score >= 0.95)
+    if top["score"] >= 0.95:
+        target = top["entry"]
+    # 2. Solo 1 coincidencia cercana o ventaja clara respecto a la segunda
+    elif len(matches) == 1 or (len(matches) > 1 and top["score"] >= 0.75 and (top["score"] - matches[1]["score"]) >= 0.15):
+        best_name = top["entry"]["name"]
+        best_grp = top["entry"].get("group", "")
+        sim_pct = int(top["score"] * 100)
+        print(f"\n{C_CYAN}[i] No se encontro exactamente '{query}'. Coincidencia mas cercana:{C_RESET}")
+        print(f"    -> {C_BOLD}{best_grp}/{best_name}{C_RESET} ({sim_pct}% de similitud)")
+        try:
+            ans = input(f"{C_BOLD}¿Deseas abrir '{best_name}' en Visual Studio Code? [S/n]: {C_RESET}").strip().lower()
+        except EOFError:
+            ans = "s"
+        if ans in ["", "s", "si", "y", "yes"]:
+            target = top["entry"]
         else:
-            print(f"\n{C_BOLD}Se encontraron multiples repositorios que coinciden con '{query}':{C_RESET}")
-            for idx, m in enumerate(matches[:8], 1):
-                print(f"  [{idx}] {m.get('group', '')}/{m['name']}")
-            try:
-                ans = input(f"{C_BOLD}Selecciona el numero a abrir: {C_RESET}").strip()
-                if ans.isdigit() and 1 <= int(ans) <= min(len(matches), 8):
-                    target = matches[int(ans) - 1]
-            except EOFError:
-                return {"success": False}
+            print(f"{C_GRAY}Operacion cancelada.{C_RESET}\n")
+            return {"success": False, "error": "Cancelled by user"}
+    # 3. Multiples coincidencias difusas
+    else:
+        print(f"\n{C_BOLD}Se encontraron multiples repositorios similares a '{query}':{C_RESET}")
+        display_candidates = matches[:8]
+        for idx, m in enumerate(display_candidates, 1):
+            e = m["entry"]
+            sim_pct = int(m["score"] * 100)
+            status_tag = f"{C_GREEN}[Clonado]{C_RESET}" if m.get("is_cloned") else f"{C_YELLOW}[En nube]{C_RESET}"
+            print(f"  [{idx}] {C_BOLD}{e.get('group', '')}/{e['name']}{C_RESET} ({sim_pct}% coincidencia) {status_tag}")
+        try:
+            ans = input(f"\n{C_BOLD}Selecciona el numero a abrir (o Enter para cancelar): {C_RESET}").strip()
+            if ans.isdigit() and 1 <= int(ans) <= len(display_candidates):
+                target = display_candidates[int(ans) - 1]["entry"]
+        except EOFError:
+            return {"success": False}
 
     if not target:
         print(f"{C_YELLOW}[!] Operacion cancelada.{C_RESET}\n")
@@ -901,13 +1280,51 @@ def open_repo_in_vscode(repos_dir, catalog, query):
             return {"success": False, "error": "User skipped clone"}
 
     print(f"\n{C_GREEN}[OK] Abriendo en Visual Studio Code:{C_RESET} {target.get('group')}/{target['name']}")
+    opened = False
     try:
         subprocess.Popen(['code', full_path], shell=(os.name == 'nt'))
+        opened = True
+    except Exception:
+        pass
+
+    if not opened and sys.platform == 'darwin':
+        for cand in [
+            '/opt/homebrew/bin/code',
+            '/usr/local/bin/code',
+            '/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code'
+        ]:
+            if os.path.isfile(cand):
+                try:
+                    subprocess.Popen([cand, full_path])
+                    opened = True
+                    break
+                except Exception:
+                    pass
+        if not opened:
+            try:
+                res = subprocess.run(['open', '-a', 'Visual Studio Code', full_path])
+                if res.returncode == 0:
+                    opened = True
+            except Exception:
+                pass
+
+    elif not opened and sys.platform == 'win32':
+        localapp = os.environ.get('LOCALAPPDATA', '')
+        if localapp:
+            win_code = os.path.join(localapp, 'Programs', 'Microsoft VS Code', 'bin', 'code.cmd')
+            if os.path.isfile(win_code):
+                try:
+                    subprocess.Popen([win_code, full_path], shell=True)
+                    opened = True
+                except Exception:
+                    pass
+
+    if opened:
         print("")
         return {"success": True, "path": full_path, "name": target['name']}
-    except Exception as e:
-        print(f"{C_RED}[ERROR] No se pudo iniciar 'code': {e}{C_RESET}\n")
-        return {"success": False, "error": str(e)}
+    else:
+        print(f"{C_RED}[ERROR] No se pudo iniciar Visual Studio Code (comando 'code'). Verifica que este instalado y en tu PATH.{C_RESET}\n")
+        return {"success": False, "error": "Could not launch VS Code"}
 
 # ==============================================================================
 # AUDITORIA Y DIAGNOSTICO PARALELO (MULTIHILO)
@@ -1096,7 +1513,13 @@ def clean_repo_hygiene(repos_dir, catalog, target_repo="all"):
 
     dirty_repos = audit["dirty"]
     if target_repo != "all":
-        dirty_repos = [r for r in dirty_repos if r["name"].lower() == target_repo.lower()]
+        matched = [r for r in dirty_repos if r["name"].lower() == target_repo.lower()]
+        if not matched:
+            matches = find_matching_repos(target_repo, [r for r in catalog if r["name"] in [d["name"] for d in dirty_repos]], repos_dir=repos_dir, cutoff=0.55)
+            if matches:
+                best_name = matches[0]["entry"]["name"]
+                matched = [r for r in dirty_repos if r["name"].lower() == best_name.lower()]
+        dirty_repos = matched
 
     if not dirty_repos:
         print(f"{C_GREEN}[OK] No hay repositorios con archivos que requieran limpieza.{C_RESET}\n")
@@ -1460,6 +1883,11 @@ def interactive_manage_gitflow(repos_dir, catalog, target_repo=None, org_filter=
     if target_repo and target_repo.lower() != "all":
         candidates = [m for m in gitflow_missing if m["entry"]["name"].lower() == target_repo.lower()]
         if not candidates:
+            gf_matches = find_matching_repos(target_repo, [m["entry"] for m in gitflow_missing], repos_dir=repos_dir, cutoff=0.55)
+            if gf_matches:
+                best_name = gf_matches[0]["entry"]["name"]
+                candidates = [m for m in gitflow_missing if m["entry"]["name"].lower() == best_name.lower()]
+        if not candidates:
             print(f"{C_GRAY}El repositorio '{target_repo}' ya tiene Gitflow o no fue encontrado.{C_RESET}\n")
             return {"configured": 0}
         gitflow_missing = candidates
@@ -1645,7 +2073,7 @@ def audit_health_360(repos_dir, catalog, with_fetch=False, org_filter=None):
 # COMMIT Y PUSH DIRECTO
 # ==============================================================================
 def commit_single_repo(repos_dir, catalog, repo_name, message):
-    """Crea un commit con los cambios pendientes en un repositorio especifico"""
+    """Crea un commit con los cambios pendientes en un repositorio especifico (con soporte fuzzy)"""
     match = None
     for entry in catalog:
         if entry["name"].lower() == repo_name.lower():
@@ -1653,7 +2081,16 @@ def commit_single_repo(repos_dir, catalog, repo_name, message):
             break
 
     if not match:
-        print(f"{C_RED}[ERROR] Repositorio '{repo_name}' no encontrado en repos.json.{C_RESET}\n")
+        matches = find_matching_repos(repo_name, catalog, repos_dir=repos_dir, cutoff=0.55)
+        if matches:
+            top = matches[0]
+            sim_pct = int(top["score"] * 100)
+            print(f"{C_CYAN}[i] Repositorio detectado por coincidencia aproximada: {top['entry'].get('group')}/{top['entry']['name']} ({sim_pct}% de similitud){C_RESET}")
+            match = top["entry"]
+
+    if not match:
+        print(f"{C_RED}[ERROR] Repositorio '{repo_name}' no encontrado en repos.json ni en disco.{C_RESET}")
+        print(f"{C_GRAY}Tip: Usa /repos para ver el listado de proyectos disponibles o /buscar <termino>.{C_RESET}\n")
         return {"success": False, "error": "Repo not found"}
 
     rel_path = match.get('path', f"{match.get('group', 'General')}/{match['name']}").replace('/', os.sep)
@@ -1729,10 +2166,10 @@ def sync_all_repos(repos_dir, catalog, auto_pull=True, auto_clone=True, org_filt
     return {"pulled": pulled, "cloned": cloned, "failed": failed_pull}
 
 def clone_specific_repo_or_org(repos_dir, catalog, target_query):
-    """Clona un repositorio puntual o una organizacion entera bajo demanda"""
+    """Clona un repositorio puntual o una organizacion entera bajo demanda con busqueda inteligente"""
     if not target_query:
         print(f"\n{C_YELLOW}[?] No indicaste que repositorio u organizacion clonar.{C_RESET}")
-        print(f"{C_GRAY}Tip: Escribe /disponibles para ver la lista de proyectos que faltan en este equipo.{C_RESET}")
+        print(f"{C_GRAY}Tip: Escribe /repos para ver todos tus proyectos o /disponibles para ver los que faltan en este equipo.{C_RESET}")
         try:
             target_query = input(f"{C_BOLD}Nombre a descargar: {C_RESET}").strip()
         except EOFError:
@@ -1743,9 +2180,12 @@ def clone_specific_repo_or_org(repos_dir, catalog, target_query):
 
     q = target_query.strip().lower()
 
-    # 1. Comprobar si coincide con una organizacion entera
-    org_matches = [c for c in catalog if c.get("group", "").lower() == q]
-    if org_matches:
+    # 1. Comprobar si coincide con una organizacion entera (exacta o difusa)
+    all_orgs = get_active_orgs(repos_dir)
+    matched_org = find_matching_org(q, all_orgs)
+
+    if matched_org:
+        org_matches = [c for c in catalog if c.get("group", "").lower() == matched_org.lower()]
         missing_in_org = []
         for item in org_matches:
             target_p = os.path.join(repos_dir, item.get('path', f"{item['group']}/{item['name']}").replace('/', os.sep))
@@ -1753,10 +2193,10 @@ def clone_specific_repo_or_org(repos_dir, catalog, target_query):
                 missing_in_org.append((item, target_p))
 
         if not missing_in_org:
-            print(f"\n{C_GREEN}[OK] Todos los repositorios de la organizacion '{target_query}' ya estan clonados localmente.{C_RESET}\n")
+            print(f"\n{C_GREEN}[OK] Todos los repositorios de la organizacion '{matched_org}' ya estan clonados localmente.{C_RESET}\n")
             return {"success": True, "already_cloned": True}
 
-        print(f"\n{C_MAGENTA}Descargando {len(missing_in_org)} repositorios de '{target_query}'...{C_RESET}")
+        print(f"\n{C_MAGENTA}Descargando {len(missing_in_org)} repositorios de '{matched_org}'...{C_RESET}")
         cloned_count = 0
         for item, tp in missing_in_org:
             os.makedirs(os.path.dirname(tp), exist_ok=True)
@@ -1764,16 +2204,53 @@ def clone_specific_repo_or_org(repos_dir, catalog, target_query):
             res = subprocess.run(["git", "clone", item['url'], tp])
             if res.returncode == 0:
                 cloned_count += 1
-        print(f"\n{C_GREEN}[OK] Descargados {cloned_count} repositorios de '{target_query}'.{C_RESET}\n")
+        print(f"\n{C_GREEN}[OK] Descargados {cloned_count} repositorios de '{matched_org}'.{C_RESET}\n")
         return {"success": True, "cloned": cloned_count}
 
-    # 2. Comprobar si coincide con un repositorio puntual
-    repo_matches = [c for c in catalog if q == c['name'].lower() or q in c['name'].lower()]
-    if not repo_matches:
-        print(f"\n{C_RED}[!] No se encontro ningun repositorio en repos.json que coincida con '{target_query}'.{C_RESET}\n")
+    # 2. Comprobar si coincide con un repositorio puntual con busqueda difusa
+    matches = find_matching_repos(target_query, catalog, repos_dir=repos_dir, cutoff=0.50)
+    if not matches:
+        print(f"\n{C_RED}[!] No se encontro ningun repositorio en el catalogo que coincida con '{target_query}'.{C_RESET}")
+        print(f"{C_GRAY}Tip: Escribe /repos para ver el catalogo completo o /disponibles para los que faltan.{C_RESET}\n")
         return {"success": False, "error": "Not found in catalog"}
 
-    chosen = repo_matches[0]
+    chosen = None
+    top = matches[0]
+    if top["score"] >= 0.95:
+        chosen = top["entry"]
+    elif len(matches) == 1 or (len(matches) > 1 and top["score"] >= 0.75 and (top["score"] - matches[1]["score"]) >= 0.15):
+        best_name = top["entry"]["name"]
+        best_grp = top["entry"].get("group", "")
+        sim_pct = int(top["score"] * 100)
+        print(f"\n{C_CYAN}[i] No se encontro exactamente '{target_query}'. Coincidencia mas cercana:{C_RESET}")
+        print(f"    -> {C_BOLD}{best_grp}/{best_name}{C_RESET} ({sim_pct}% de similitud)")
+        try:
+            ans = input(f"{C_BOLD}¿Deseas descargar '{best_name}'? [S/n]: {C_RESET}").strip().lower()
+        except EOFError:
+            ans = "s"
+        if ans in ["", "s", "si", "y", "yes"]:
+            chosen = top["entry"]
+        else:
+            print(f"{C_GRAY}Operacion cancelada.{C_RESET}\n")
+            return {"success": False, "error": "Cancelled"}
+    else:
+        print(f"\n{C_BOLD}Se encontraron multiples repositorios similares a '{target_query}':{C_RESET}")
+        for idx, m in enumerate(matches[:8], 1):
+            e = m["entry"]
+            sim_pct = int(m["score"] * 100)
+            status_tag = f"{C_GREEN}[Ya clonado]{C_RESET}" if m.get("is_cloned") else f"{C_YELLOW}[Disponible para clonar]{C_RESET}"
+            print(f"  [{idx}] {C_BOLD}{e.get('group', '')}/{e['name']}{C_RESET} ({sim_pct}% coincidencia) {status_tag}")
+        try:
+            ans = input(f"\n{C_BOLD}Selecciona el numero a descargar: {C_RESET}").strip()
+            if ans.isdigit() and 1 <= int(ans) <= min(len(matches), 8):
+                chosen = matches[int(ans) - 1]["entry"]
+        except EOFError:
+            return {"success": False}
+
+    if not chosen:
+        print(f"{C_YELLOW}[!] Operacion cancelada.{C_RESET}\n")
+        return {"success": False, "error": "Cancelled"}
+
     target_p = os.path.join(repos_dir, chosen.get('path', f"{chosen.get('group')}/{chosen['name']}").replace('/', os.sep))
 
     if os.path.isdir(target_p):
@@ -2149,9 +2626,13 @@ TUS CAPACIDADES MEDIANTE HERRAMIENTAS:
 16. `check_new_remote_repos`: Escanea GitHub para detectar si colegas agregaron repositorios nuevos y ofrece clonarlos.
 17. `start_watchdog`: Activa el modo vigilante con notificaciones nativas del sistema operativo.
 18. `run_onboarding`: Diagnostica y reorganiza carpetas existentes en la raiz hacia las 10 organizaciones oficiales.
+19. `list_repositories`: Lista y filtra los repositorios del catalogo y del equipo (clonados vs en la nube). Usalo SIEMPRE que el usuario pida un listado, ver repositorios, o consultar que proyectos existen.
+20. `search_repositories`: Busca repositorios con tolerancia a errores tipograficos, faltas de ortografia y nombres aproximados (fuzzy matching).
 
 REGLAS DE INTERACCION:
 - Responde siempre de forma concisa, profesional, clara, cercana y en espanol con tono de Medico DevOps de cabecera.
+- Si el usuario pide un listado o ver qué repositorios tiene ('dame un listado', 'que repos tengo', 'mostrar repos', 'listar proyectos'), ejecuta INMEDIATAMENTE `list_repositories`.
+- Si el usuario menciona un nombre aproximado o mal escrito de un repositorio (ej. 'peluza' por 'pelusa', 'audio' por 'TranscriptAudio'), las herramientas cuentan con busqueda difusa (fuzzy search) integrada y encontraran el proyecto adecuado automaticamente.
 - Apoya tanto al usuario principal como a cualquier colega que use la herramienta.
 - Explica los resultados de manera sencilla y siempre sugiere el comando rapido para que el usuario aprenda.
 - Nunca expongas tokens, claves ni URLs con datos sensibles.
@@ -2421,6 +2902,42 @@ GEMINI_TOOLS = [
                         }
                     },
                     "required": ["action"]
+                }
+            },
+            {
+                "name": "list_repositories",
+                "description": "Lista y muestra los repositorios del catalogo y del equipo, con estado de clonacion y rama activa. Usala SIEMPRE que el usuario pida un listado, ver que proyectos tiene, o filtrar por organizacion.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "query": {
+                            "type": "STRING",
+                            "description": "Filtro opcional por nombre o termino de busqueda"
+                        },
+                        "org_name": {
+                            "type": "STRING",
+                            "description": "Filtro opcional por organizacion (ej: 'Personal', 'th-mex', etc.)"
+                        },
+                        "status_filter": {
+                            "type": "STRING",
+                            "enum": ["all", "cloned", "uncloned"],
+                            "description": "Filtrar por estado: 'cloned' (clonados en este equipo), 'uncloned' (solo en la nube) o 'all' (todos)"
+                        }
+                    }
+                }
+            },
+            {
+                "name": "search_repositories",
+                "description": "Busca repositorios por nombre, termino o coincidencia difusa con tolerancia a faltas de ortografia (fuzzy search).",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "query": {
+                            "type": "STRING",
+                            "description": "Nombre o termino del repositorio a buscar (incluso con faltas de ortografia o nombres parciales)"
+                        }
+                    },
+                    "required": ["query"]
                 }
             }
         ]
@@ -2810,6 +3327,33 @@ def execute_tool_call(tool_name, args, repos_dir, catalog, catalog_file, api_key
     elif tool_name == "open_in_vscode":
         repo_name = args.get("repo_name", "")
         return open_repo_in_vscode(repos_dir, catalog, repo_name)
+
+    elif tool_name == "list_repositories":
+        query = args.get("query", "")
+        org_name = args.get("org_name", "")
+        status_filter = args.get("status_filter", "all")
+        return list_repositories(repos_dir, catalog, query=query, org_name=org_name, status_filter=status_filter, interactive=True)
+
+    elif tool_name == "search_repositories":
+        query = args.get("query", "")
+        matches = find_matching_repos(query, catalog, repos_dir=repos_dir, cutoff=0.45)
+        return {
+            "query": query,
+            "total_matches": len(matches),
+            "matches": [
+                {
+                    "name": m["entry"]["name"],
+                    "group": m["entry"].get("group", ""),
+                    "path": m["entry"].get("path", ""),
+                    "score": m["score"],
+                    "similarity_percent": int(m["score"] * 100),
+                    "match_type": m["match_type"],
+                    "is_cloned": m.get("is_cloned", False),
+                    "url": m["entry"].get("url", "")
+                }
+                for m in matches[:10]
+            ]
+        }
 
     elif tool_name == "manage_organizations":
         action = args.get("action", "list")
@@ -3423,6 +3967,8 @@ def print_helpme_commands():
     print(f"  * {C_WHITE}/apagar{C_RESET} (o {C_WHITE}checkout{C_RESET})       : Auditoria pre-flight de salida segura antes de apagar o cambiar a Mac.\n")
 
     print(f"{C_BOLD}{C_CYAN}🔄 SINCRONIZACION Y GESTION DE CODIGO:{C_RESET}")
+    print(f"  * {C_WHITE}/repos{C_RESET} [filtro|org]         : Listado completo de proyectos con estado (clonados en disco vs en la nube).")
+    print(f"  * {C_WHITE}/buscar <termino>{C_RESET}         : Busqueda difusa e inteligente con tolerancia a faltas de ortografia.")
     print(f"  * {C_WHITE}/catalogo{C_RESET} [push|pull|status]: Gestiona tu Boveda Privada (Gist Secreto) para compartir repos entre Windows y Mac.")
     print(f"  * {C_WHITE}/sync{C_RESET} [org]               : Descarga cambios remotos en paralelo con pull lineal (--ff-only).")
     print(f"  * {C_WHITE}/push{C_RESET} [repo|all]          : Sube a GitHub los commits locales que van adelante.")
@@ -3562,6 +4108,17 @@ COMMAND_MAP = {
     "perfiles": "/perfiles",
     "identidades": "/perfiles",
     "trabajos": "/perfiles",
+    "repos": "/repos",
+    "repo": "/repos",
+    "list": "/repos",
+    "lista": "/repos",
+    "listar": "/repos",
+    "listado": "/repos",
+    "proyectos": "/repos",
+    "catalogo-repos": "/repos",
+    "buscar": "/buscar",
+    "search": "/buscar",
+    "find": "/buscar",
     "ayuda": "/ayuda",
     "help": "/ayuda",
     "helpme": "/ayuda",
@@ -3577,20 +4134,88 @@ CANONICAL_SLASH_COMMANDS = [
     "/code", "/orgs", "/modo", "/clone", "/disponibles", "/nuevos", "/salud", "/seguridad",
     "/gitflow", "/onboarding", "/limpiar", "/disco", "/sync", "/push", "/commit", "/apagar",
     "/vigilante", "/github", "/perfiles", "/catalogo", "/login", "/switch", "/logout", "/git-id", "/dir",
-    "/importar-github", "/publico", "/ia", "/set-key", "/ayuda", "/helpme", "/salir"
+    "/importar-github", "/publico", "/ia", "/set-key", "/ayuda", "/helpme", "/salir",
+    "/repos", "/buscar"
 ]
 
 def resolve_user_command(user_input):
     """
     Motor Antierrores:
-    1. Reconoce comandos tanto con '/' como sin '/' (ej. 'salud', 'code amps', 'sync').
-    2. Si hay un error tipografico en un comando (ej. '/saldu', '/synk', '/clonn', '/apago'),
+    1. Reconoce comandos tanto con '/' como sin '/' (ej. 'salud', 'code amps', 'sync', 'repos', 'buscar').
+    2. Detecta expresiones naturales de listado y busqueda ('dame un listado', 'cuales repos tengo', 'abrir repo x').
+    3. Si hay un error tipografico en un comando (ej. '/saldu', '/synk', '/clonn', '/apago', '/reposs'),
        sugiere interactivamente la correccion adecuada.
-    3. Si no es comando, devuelve None para que Gemini AI lo atienda como lenguaje natural.
+    4. Si no es comando, devuelve None para que Gemini AI lo atienda como lenguaje natural.
     """
     raw = user_input.strip()
     if not raw:
         return None, ""
+
+    # Normalizar para detectar frases naturales
+    clean_lower = re.sub(r'[¿?¡!.,;:]', '', raw.lower()).strip()
+
+    # Deteccion de frases naturales de LISTADO
+    # Ejemplos: "dame un listado", "dame una lista", "ver repos", "que repos tengo", "cuales son mis repos", "listado de repos"
+    LIST_PHRASES = [
+        "dame un listado", "dame una lista", "dame el listado", "dame la lista",
+        "ver listado", "ver lista", "ver repos", "ver repositorios", "ver proyectos",
+        "mostrar listado", "mostrar lista", "mostrar repos", "mostrar repositorios", "mostrar proyectos",
+        "listar repos", "listar repositorios", "listar proyectos", "listar", "listado", "lista",
+        "listado de repos", "listado de repositorios", "listado de proyectos",
+        "lista de repos", "lista de repositorios", "lista de proyectos",
+        "que repos tengo", "que repositorios tengo", "que proyectos tengo",
+        "cuales repos tengo", "cuales repositorios tengo", "cuales proyectos tengo",
+        "cuales son mis repos", "cuales son mis repositorios", "cuales son mis proyectos",
+        "mis repos", "mis repositorios", "mis proyectos"
+    ]
+
+    for phrase in sorted(LIST_PHRASES, key=len, reverse=True):
+        if clean_lower == phrase:
+            return "/repos", ""
+        if clean_lower.startswith(phrase + " "):
+            remainder = clean_lower[len(phrase):].strip()
+            remainder = re.sub(r'^(de\s+|en\s+|del\s+|los\s+|las\s+|de\s+los\s+|de\s+las\s+)', '', remainder).strip()
+            if remainder in ["repos", "los repos", "mis repos", "repositorios", "los repositorios", "mis repositorios", "proyectos", "los proyectos", "mis proyectos"]:
+                remainder = ""
+            return "/repos", remainder
+
+    # Deteccion de frases naturales de BUSQUEDA
+    # Ejemplos: "busca el repo pelusa", "buscar repositorio transcript", "donde esta pelusa"
+    SEARCH_PREFIXES = [
+        "busca el repo ", "busca el repositorio ", "busca el proyecto ", "busca repo ",
+        "buscar el repo ", "buscar el repositorio ", "buscar el proyecto ", "buscar repo ",
+        "donde esta el repo ", "donde esta el repositorio ", "donde esta el proyecto ", "donde esta ",
+        "encuentra el repo ", "encuentra el repositorio ", "encuentra "
+    ]
+    for prefix in SEARCH_PREFIXES:
+        if clean_lower.startswith(prefix):
+            remainder = clean_lower[len(prefix):].strip()
+            return "/buscar", remainder
+
+    # Deteccion de frases naturales de ABRIR EN VS CODE
+    OPEN_PREFIXES = [
+        "abre el repo ", "abre el repositorio ", "abre el proyecto ",
+        "abrir el repo ", "abrir el repositorio ", "abrir el proyecto ",
+        "abreme el repo ", "abreme el repositorio ", "abreme el proyecto ",
+        "abre ", "abrir ", "abreme "
+    ]
+    for prefix in OPEN_PREFIXES:
+        if clean_lower.startswith(prefix):
+            remainder = clean_lower[len(prefix):].strip()
+            if remainder not in ["code", "vscode", "visual"]:
+                return "/code", remainder
+
+    # Deteccion de frases naturales de CLONAR
+    CLONE_PREFIXES = [
+        "clona el repo ", "clona el repositorio ", "clona la organizacion ", "clona la org ",
+        "clonar el repo ", "clonar el repositorio ", "clonar la organizacion ",
+        "descarga el repo ", "descarga el repositorio ", "descargar el repo ",
+        "clona ", "clonar ", "descarga ", "descargar "
+    ]
+    for prefix in CLONE_PREFIXES:
+        if clean_lower.startswith(prefix):
+            remainder = clean_lower[len(prefix):].strip()
+            return "/clone", remainder
 
     parts = raw.split(None, 1)
     tok = parts[0]
@@ -3623,6 +4248,186 @@ def resolve_user_command(user_input):
 
     # C) Si no parece comando, es conversacion para Gemini
     return None, raw
+
+# ==============================================================================
+# DESPACHADOR DE COMANDOS CANONICOS (CLI DIRECTO + REPL INTERACTIVO)
+# ==============================================================================
+def dispatch_single_command(canon_cmd, rest, repos_dir, catalog, catalog_file, gh_info, enabled_orgs, disabled_orgs, local_cfg, script_dir, all_known_orgs):
+    """Ejecuta un comando canonico reconocido por GitDoctor tanto en modo CLI directo como en REPL interactivo"""
+    if canon_cmd in ["/ayuda", "/helpme"]:
+        print_helpme_commands()
+
+    elif canon_cmd == "/repos":
+        list_repositories(repos_dir, catalog, query=rest if rest else "", interactive=True)
+
+    elif canon_cmd == "/buscar":
+        if not rest:
+            try:
+                rest = input(f"{C_BOLD}Nombre o termino del proyecto a buscar: {C_RESET}").strip()
+            except EOFError:
+                rest = ""
+        if rest:
+            search_repositories_cli(repos_dir, catalog, rest)
+
+    elif canon_cmd == "/code":
+        if not rest:
+            print(f"\n{C_YELLOW}[?] No indicaste el repositorio a abrir.{C_RESET}")
+            try:
+                rest = input(f"{C_BOLD}Nombre o termino del proyecto a abrir en VS Code: {C_RESET}").strip()
+            except EOFError:
+                rest = ""
+        if rest:
+            open_repo_in_vscode(repos_dir, catalog, rest)
+
+    elif canon_cmd == "/orgs":
+        interactive_manage_orgs(repos_dir, catalog, local_cfg, script_dir, all_known_orgs)
+
+    elif canon_cmd == "/modo":
+        interactive_toggle_sync_mode(script_dir, local_cfg)
+
+    elif canon_cmd == "/clone":
+        if not rest:
+            print(f"\n{C_YELLOW}[?] No indicaste qué repositorio u organizacion clonar.{C_RESET}")
+            print(f"{C_GRAY}Tip: Escribe /disponibles para ver la lista de repos que faltan en este equipo o /repos para ver todos.{C_RESET}")
+            try:
+                rest = input(f"{C_BOLD}Nombre a descargar: {C_RESET}").strip()
+            except EOFError:
+                rest = ""
+        if rest:
+            clone_specific_repo_or_org(repos_dir, catalog, rest)
+
+    elif canon_cmd == "/disponibles":
+        list_available_uncloned_repos(repos_dir, catalog)
+
+    elif canon_cmd == "/nuevos":
+        check_for_new_remote_repos(repos_dir, catalog, catalog_file, gh_info, enabled_orgs, interactive=True)
+
+    elif canon_cmd == "/disco":
+        check_and_prune_disk(repos_dir, catalog, auto_prune=False)
+
+    elif canon_cmd == "/apagar":
+        safe_preflight_checkout(repos_dir, catalog)
+
+    elif canon_cmd == "/salud":
+        if "360" in rest.lower():
+            with_fetch = "fetch" in rest.lower() or "-f" in rest.lower()
+            see_all = "-all" in rest.lower() or "all" in rest.lower()
+            org_filter = None if see_all or not disabled_orgs else enabled_orgs
+            audit_health_360(repos_dir, catalog, with_fetch=with_fetch, org_filter=org_filter)
+        else:
+            with_fetch = "fetch" in rest.lower() or "-f" in rest.lower()
+            see_all = "-all" in rest.lower() or "all" in rest.lower()
+            org_filter = None if see_all or not disabled_orgs else enabled_orgs
+            scope_str = "todos los repositorios" if see_all or not disabled_orgs else f"{len(enabled_orgs)} organizaciones activas"
+            print(f"\n{C_CYAN}[*] Evaluando salud ({scope_str}, {'con fetch remoto' if with_fetch else 'local'})...{C_RESET}")
+            audit = audit_all_repos(repos_dir, catalog, with_fetch=with_fetch, org_filter=org_filter)
+            print_health_report(audit)
+
+    elif canon_cmd == "/seguridad":
+        with_fetch = "fetch" in rest.lower() or "-f" in rest.lower()
+        see_all = "-all" in rest.lower() or "all" in rest.lower()
+        org_filter = None if see_all or not disabled_orgs else enabled_orgs
+        audit_health_360(repos_dir, catalog, with_fetch=with_fetch, org_filter=org_filter)
+
+    elif canon_cmd == "/gitflow":
+        target = rest.strip() if rest else None
+        org_filter = None if not disabled_orgs else enabled_orgs
+        interactive_manage_gitflow(repos_dir, catalog, target_repo=target, org_filter=org_filter)
+
+    elif canon_cmd == "/onboarding":
+        if run_onboarding_assistant:
+            run_onboarding_assistant(repos_dir, interactive=True)
+        else:
+            print(f"{C_RED}[!] Modulo onboarding.py no disponible.{C_RESET}\n")
+
+    elif canon_cmd == "/limpiar":
+        target = rest.strip() if rest else "all"
+        clean_repo_hygiene(repos_dir, catalog, target_repo=target)
+
+    elif canon_cmd == "/sync":
+        target_org = rest.strip() if rest else None
+        org_filter = [target_org] if target_org else (enabled_orgs if disabled_orgs else None)
+        sync_all_repos(repos_dir, catalog, auto_pull=True, auto_clone=True, org_filter=org_filter)
+        if gh_info.get('logged_in'):
+            check_for_new_remote_repos(repos_dir, catalog, catalog_file, gh_info, org_filter or enabled_orgs, interactive=True)
+
+    elif canon_cmd == "/push":
+        target = rest.strip() if rest else "all"
+        push_ahead_repos(repos_dir, catalog, target_repo=target)
+
+    elif canon_cmd == "/commit":
+        parts = rest.split(None, 1) if rest else []
+        if len(parts) >= 2:
+            r_target, c_msg = parts[0], parts[1]
+        else:
+            r_target = parts[0] if len(parts) == 1 else ""
+            if not r_target:
+                try:
+                    r_target = input(f"{C_BOLD}Repositorio a commitear: {C_RESET}").strip()
+                except EOFError:
+                    r_target = ""
+            try:
+                c_msg = input(f"{C_BOLD}Mensaje descriptivo del commit: {C_RESET}").strip()
+            except EOFError:
+                c_msg = ""
+        if r_target and c_msg:
+            commit_single_repo(repos_dir, catalog, r_target, c_msg)
+        else:
+            print(f"{C_YELLOW}[!] Operacion de commit cancelada.{C_RESET}\n")
+
+    elif canon_cmd == "/github":
+        gh_info_fresh = get_github_status()
+        print_github_profile(gh_info_fresh)
+
+    elif canon_cmd == "/login":
+        interactive_github_login()
+
+    elif canon_cmd == "/switch":
+        target = rest.strip() if rest else None
+        interactive_github_switch(target_user=target)
+
+    elif canon_cmd == "/logout":
+        target = rest.strip() if rest else None
+        interactive_github_logout(target_user=target)
+
+    elif canon_cmd == "/git-id":
+        parts = rest.split(None, 1) if rest else []
+        if len(parts) == 2:
+            interactive_git_identity(name=parts[0], email=parts[1])
+        else:
+            interactive_git_identity()
+
+    elif canon_cmd == "/dir":
+        set_custom_repos_dir(script_dir, local_cfg, new_dir=rest if rest else None)
+
+    elif canon_cmd == "/catalogo":
+        parts = rest.split(None, 1) if rest else []
+        act = parts[0] if len(parts) >= 1 else None
+        p_arg = parts[1] if len(parts) >= 2 else None
+        interactive_manage_catalog_vault(script_dir, local_cfg, gh_info, action=act, param=p_arg, repos_dir=repos_dir)
+
+    elif canon_cmd == "/importar-github":
+        import_repos_from_github(script_dir, gh_info)
+
+    elif canon_cmd == "/publico":
+        prepare_for_public_repo(script_dir)
+
+    elif canon_cmd == "/vigilante":
+        sec = 300
+        if rest and rest.isdigit():
+            sec = int(rest)
+        notif_flag = local_cfg.get("notifications_enabled", True)
+        start_watchdog_loop(repos_dir, catalog, interval_seconds=sec, send_notifications=notif_flag,
+                            catalog_file=catalog_file, gh_info=gh_info, active_orgs=enabled_orgs)
+
+    elif canon_cmd == "/set-key":
+        load_gemini_api_key(script_dir, interactive=True)
+
+    elif canon_cmd == "/ia":
+        interactive_switch_ai(local_cfg, script_dir, target=rest if rest else None)
+
+    elif canon_cmd == "/perfiles":
+        interactive_manage_profiles(repos_dir, catalog, local_cfg, script_dir)
 
 # ==============================================================================
 # BUCLE PRINCIPAL CONVERSACIONAL (REPL)
@@ -3694,6 +4499,18 @@ def main():
 
     api_key = load_gemini_api_key(script_dir, interactive=False)
 
+    # Modo CLI Directo: Si se ejecuto 'gitdoctor <comando>' o 'python3 agent.py <comando>'
+    if len(sys.argv) > 1:
+        cli_raw = " ".join(sys.argv[1:]).strip()
+        if cli_raw in ["-h", "--help", "help", "/help", "ayuda", "/ayuda"]:
+            print_helpme_commands()
+            return
+
+        canon_cmd, rest = resolve_user_command(cli_raw)
+        if canon_cmd and canon_cmd != "CANCELLED":
+            dispatch_single_command(canon_cmd, rest, repos_dir, catalog, catalog_file, gh_info, enabled_orgs, disabled_orgs, local_cfg, script_dir, all_known_orgs)
+            return
+
     print(f"\n{C_CYAN}================================================================{C_RESET}")
     print(f"{C_WHITE}{C_BOLD}     🩺 GitDoctor AI -- Suite Clinica y DevOps de Repositorios  {C_RESET}")
     print(f"{C_CYAN}================================================================{C_RESET}")
@@ -3732,6 +4549,8 @@ def main():
     print_health_report(init_audit)
 
     print(f"{C_WHITE}Comandos principales de GitDoctor:{C_RESET}")
+    print(f"  {C_BOLD}/repos{C_RESET} [filtro|org]        {C_GRAY}Listado completo de proyectos (clonados en disco vs en la nube){C_RESET}")
+    print(f"  {C_BOLD}/buscar <termino>{C_RESET}         {C_GRAY}Busqueda inteligente con tolerancia a faltas de ortografia{C_RESET}")
     print(f"  {C_BOLD}/salud 360{C_RESET} (o /seguridad)  {C_GRAY}Auditoria profunda: Secretos, API keys, Gitflow e higiene{C_RESET}")
     print(f"  {C_BOLD}/gitflow{C_RESET} [repo|all]        {C_GRAY}Auditar e implementar estrategia Gitflow (crea rama develop){C_RESET}")
     print(f"  {C_BOLD}/perfiles{C_RESET}                  {C_GRAY}Gestionar identidades de commit por organizacion (Multi-Trabajo){C_RESET}")
@@ -3769,254 +4588,27 @@ def main():
             print(f"\n{C_GRAY}Cerrando GitDoctor. Hasta pronto!{C_RESET}\n")
             break
 
-        elif canon_cmd in ["/ayuda", "/helpme"]:
-            print_helpme_commands()
-            continue
-
-        elif canon_cmd == "/code":
-            if not rest:
-                print(f"\n{C_YELLOW}[?] No indicaste el repositorio a abrir.{C_RESET}")
-                try:
-                    rest = input(f"{C_BOLD}Nombre o termino del proyecto a abrir en VS Code: {C_RESET}").strip()
-                except EOFError:
-                    rest = ""
-            if rest:
-                open_repo_in_vscode(repos_dir, catalog, rest)
-            continue
-
-        elif canon_cmd == "/orgs":
-            local_cfg = interactive_manage_orgs(repos_dir, catalog, local_cfg, script_dir, all_known_orgs)
-            disabled_orgs = set(local_cfg.get("disabled_orgs", [])) if local_cfg.get("sync_mode") == "selective" else set()
-            enabled_orgs = [o for o in all_known_orgs if o not in disabled_orgs]
-            system_instruction = build_system_instruction(enabled_orgs, user_name=gh_info.get('name') or gh_info.get('user'))
-            continue
-
-        elif canon_cmd == "/modo":
-            interactive_toggle_sync_mode(script_dir, local_cfg)
-            disabled_orgs = set(local_cfg.get("disabled_orgs", [])) if local_cfg.get("sync_mode") == "selective" else set()
-            enabled_orgs = [o for o in all_known_orgs if o not in disabled_orgs]
-            system_instruction = build_system_instruction(enabled_orgs, user_name=gh_info.get('name') or gh_info.get('user'))
-            continue
-
-        elif canon_cmd == "/clone":
-            if not rest:
-                print(f"\n{C_YELLOW}[?] No indicaste qué repositorio u organizacion clonar.{C_RESET}")
-                print(f"{C_GRAY}Tip: Escribe /disponibles para ver la lista de repos que faltan en este equipo.{C_RESET}")
-                try:
-                    rest = input(f"{C_BOLD}Nombre a descargar: {C_RESET}").strip()
-                except EOFError:
-                    rest = ""
-            if rest:
-                clone_specific_repo_or_org(repos_dir, catalog, rest)
-            continue
-
-        elif canon_cmd == "/disponibles":
-            list_available_uncloned_repos(repos_dir, catalog)
-            continue
-
-        elif canon_cmd == "/nuevos":
-            check_for_new_remote_repos(repos_dir, catalog, catalog_file, gh_info, enabled_orgs, interactive=True)
-            continue
-
-        elif canon_cmd == "/disco":
-            check_and_prune_disk(repos_dir, catalog, auto_prune=False)
-            continue
-
-        elif canon_cmd == "/apagar":
-            safe_preflight_checkout(repos_dir, catalog)
-            continue
-
-        elif canon_cmd == "/salud":
-            if "360" in rest.lower():
-                with_fetch = "fetch" in rest.lower() or "-f" in rest.lower()
-                see_all = "-all" in rest.lower() or "all" in rest.lower()
-                org_filter = None if see_all or not disabled_orgs else enabled_orgs
-                audit_health_360(repos_dir, catalog, with_fetch=with_fetch, org_filter=org_filter)
-                continue
-            with_fetch = "fetch" in rest.lower() or "-f" in rest.lower()
-            see_all = "-all" in rest.lower() or "all" in rest.lower()
-            org_filter = None if see_all or not disabled_orgs else enabled_orgs
-            scope_str = "todos los repositorios" if see_all or not disabled_orgs else f"{len(enabled_orgs)} organizaciones activas"
-            print(f"\n{C_CYAN}[*] Evaluando salud ({scope_str}, {'con fetch remoto' if with_fetch else 'local'})...{C_RESET}")
-            audit = audit_all_repos(repos_dir, catalog, with_fetch=with_fetch, org_filter=org_filter)
-            print_health_report(audit)
-            continue
-
-        elif canon_cmd == "/seguridad":
-            with_fetch = "fetch" in rest.lower() or "-f" in rest.lower()
-            see_all = "-all" in rest.lower() or "all" in rest.lower()
-            org_filter = None if see_all or not disabled_orgs else enabled_orgs
-            audit_health_360(repos_dir, catalog, with_fetch=with_fetch, org_filter=org_filter)
-            continue
-
-        elif canon_cmd == "/gitflow":
-            target = rest.strip() if rest else None
-            org_filter = None if not disabled_orgs else enabled_orgs
-            interactive_manage_gitflow(repos_dir, catalog, target_repo=target, org_filter=org_filter)
-            continue
-
-        elif canon_cmd == "/onboarding":
-            if run_onboarding_assistant:
-                run_onboarding_assistant(repos_dir, interactive=True)
-            else:
-                print(f"{C_RED}[!] Modulo onboarding.py no disponible.{C_RESET}\n")
-            continue
-
-        elif canon_cmd == "/limpiar":
-            target = rest.strip() if rest else "all"
-            clean_repo_hygiene(repos_dir, catalog, target_repo=target)
-            continue
-
-        elif canon_cmd == "/sync":
-            target_org = rest.strip() if rest else None
-            org_filter = [target_org] if target_org else (enabled_orgs if disabled_orgs else None)
-            sync_all_repos(repos_dir, catalog, auto_pull=True, auto_clone=True, org_filter=org_filter)
-            if gh_info.get('logged_in'):
-                check_for_new_remote_repos(repos_dir, catalog, catalog_file, gh_info, org_filter or enabled_orgs, interactive=True)
-            continue
-
-        elif canon_cmd == "/push":
-            target = rest.strip() if rest else "all"
-            push_ahead_repos(repos_dir, catalog, target_repo=target)
-            continue
-
-        elif canon_cmd == "/commit":
-            parts = rest.split(None, 1) if rest else []
-            if len(parts) >= 2:
-                r_target, c_msg = parts[0], parts[1]
-            else:
-                r_target = parts[0] if len(parts) == 1 else ""
-                if not r_target:
-                    try:
-                        r_target = input(f"{C_BOLD}Repositorio a commitear: {C_RESET}").strip()
-                    except EOFError:
-                        r_target = ""
-                try:
-                    c_msg = input(f"{C_BOLD}Mensaje descriptivo del commit: {C_RESET}").strip()
-                except EOFError:
-                    c_msg = ""
-            if r_target and c_msg:
-                commit_single_repo(repos_dir, catalog, r_target, c_msg)
-            else:
-                print(f"{C_YELLOW}[!] Operacion de commit cancelada.{C_RESET}\n")
-            continue
-
-        elif canon_cmd == "/github":
-            gh_info = get_github_status()
-            print_github_profile(gh_info)
-            continue
-
-        elif canon_cmd == "/login":
-            interactive_github_login()
-            gh_info = get_github_status()
-            all_known_orgs = get_active_orgs(repos_dir, gh_info)
-            disabled_orgs = set(local_cfg.get("disabled_orgs", []))
-            enabled_orgs = [o for o in all_known_orgs if o not in disabled_orgs]
-            system_instruction = build_system_instruction(enabled_orgs)
-            continue
-
-        elif canon_cmd == "/switch":
-            target = rest.strip() if rest else None
-            interactive_github_switch(target_user=target)
-            gh_info = get_github_status()
-            all_known_orgs = get_active_orgs(repos_dir, gh_info)
-            disabled_orgs = set(local_cfg.get("disabled_orgs", []))
-            enabled_orgs = [o for o in all_known_orgs if o not in disabled_orgs]
-            system_instruction = build_system_instruction(enabled_orgs)
-            continue
-
-        elif canon_cmd == "/logout":
-            target = rest.strip() if rest else None
-            interactive_github_logout(target_user=target)
-            gh_info = get_github_status()
-            all_known_orgs = get_active_orgs(repos_dir, gh_info)
-            disabled_orgs = set(local_cfg.get("disabled_orgs", []))
-            enabled_orgs = [o for o in all_known_orgs if o not in disabled_orgs]
-            system_instruction = build_system_instruction(enabled_orgs)
-            continue
-
-        elif canon_cmd == "/git-id":
-            parts = rest.split(None, 1) if rest else []
-            if len(parts) == 2:
-                interactive_git_identity(name=parts[0], email=parts[1])
-            else:
-                interactive_git_identity()
-            continue
-
-        elif canon_cmd == "/dir":
-            repos_dir = set_custom_repos_dir(script_dir, local_cfg, new_dir=rest if rest else None)
-            all_known_orgs = get_active_orgs(repos_dir, gh_info)
-            disabled_orgs = set(local_cfg.get("disabled_orgs", []))
-            enabled_orgs = [o for o in all_known_orgs if o not in disabled_orgs]
-            system_instruction = build_system_instruction(enabled_orgs)
-            continue
-
-        elif canon_cmd == "/catalogo":
-            parts = rest.split(None, 1) if rest else []
-            act = parts[0] if len(parts) >= 1 else None
-            p_arg = parts[1] if len(parts) >= 2 else None
-            interactive_manage_catalog_vault(script_dir, local_cfg, gh_info, action=act, param=p_arg, repos_dir=repos_dir)
-            cat_local = os.path.join(script_dir, "repos.local.json")
-            if os.path.isfile(cat_local):
-                catalog_file = cat_local
-                try:
-                    with open(catalog_file, "r", encoding="utf-8-sig") as f:
-                        catalog = json.load(f)
-                    catalog = [c for c in catalog if c.get("name") not in ["gitdoctor", "repos-sync"] and not c.get("url", "").endswith("/gitdoctor.git") and not c.get("url", "").endswith("/repos-sync.git")]
-                except Exception:
-                    pass
+        if canon_cmd:
+            dispatch_single_command(canon_cmd, rest, repos_dir, catalog, catalog_file, gh_info, enabled_orgs, disabled_orgs, local_cfg, script_dir, all_known_orgs)
+            if canon_cmd in ["/orgs", "/modo", "/login", "/switch", "/logout", "/catalogo", "/importar-github", "/publico", "/dir", "/set-key", "/ia"]:
+                gh_info = get_github_status()
                 all_known_orgs = get_active_orgs(repos_dir, gh_info)
                 disabled_orgs = set(local_cfg.get("disabled_orgs", [])) if local_cfg.get("sync_mode") == "selective" else set()
                 enabled_orgs = [o for o in all_known_orgs if o not in disabled_orgs]
                 system_instruction = build_system_instruction(enabled_orgs, user_name=gh_info.get('name') or gh_info.get('user'))
-            continue
-
-        elif canon_cmd == "/importar-github":
-            res = import_repos_from_github(script_dir, gh_info)
-            if res.get("success"):
                 cat_local = os.path.join(script_dir, "repos.local.json")
                 if os.path.isfile(cat_local):
-                    catalog_file = cat_local
-                    with open(catalog_file, "r", encoding="utf-8-sig") as f:
-                        catalog = json.load(f)
-                    all_known_orgs = get_active_orgs(repos_dir, gh_info)
-                    disabled_orgs = set(local_cfg.get("disabled_orgs", []))
-                    enabled_orgs = [o for o in all_known_orgs if o not in disabled_orgs]
-                    system_instruction = build_system_instruction(enabled_orgs, user_name=gh_info.get('name') or gh_info.get('user'))
-            continue
-
-        elif canon_cmd == "/publico":
-            prepare_for_public_repo(script_dir)
-            cat_local = os.path.join(script_dir, "repos.local.json")
-            if os.path.isfile(cat_local):
-                catalog_file = cat_local
-                with open(catalog_file, "r", encoding="utf-8-sig") as f:
-                    catalog = json.load(f)
-            continue
-
-        elif canon_cmd == "/vigilante":
-            sec = 300
-            if rest and rest.isdigit():
-                sec = int(rest)
-            notif_flag = local_cfg.get("notifications_enabled", True)
-            start_watchdog_loop(repos_dir, catalog, interval_seconds=sec, send_notifications=notif_flag,
-                                catalog_file=catalog_file, gh_info=gh_info, active_orgs=enabled_orgs)
-            continue
-
-        elif canon_cmd == "/set-key":
-            new_key = load_gemini_api_key(script_dir, interactive=True)
-            if new_key:
-                api_key = new_key
-                _CACHED_GEMINI_MODELS = []
-                print(f"{C_GREEN}[OK] Gemini AI listo con clave actualizada.{C_RESET}\n")
-            continue
-
-        elif canon_cmd == "/ia":
-            local_cfg = interactive_switch_ai(local_cfg, script_dir, target=rest if rest else None)
-            continue
-
-        elif canon_cmd == "/perfiles":
-            interactive_manage_profiles(repos_dir, catalog, local_cfg, script_dir)
+                    try:
+                        with open(cat_local, "r", encoding="utf-8-sig") as f:
+                            catalog = json.load(f)
+                        catalog = [c for c in catalog if c.get("name") not in ["gitdoctor", "repos-sync"] and not c.get("url", "").endswith("/gitdoctor.git") and not c.get("url", "").endswith("/repos-sync.git")]
+                    except Exception:
+                        pass
+                if canon_cmd == "/set-key":
+                    new_key = load_gemini_api_key(script_dir, interactive=False)
+                    if new_key:
+                        api_key = new_key
+                        _CACHED_GEMINI_MODELS = []
             continue
 
         # Turno conversacional con IA

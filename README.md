@@ -186,7 +186,9 @@ Todos los comandos se pueden escribir con barra (`/comando`) o sin barra (`coman
 
 | Comando | Sinónimos aceptados | Qué hace | Ejemplo |
 | :--- | :--- | :--- | :--- |
-| **`/code`** | `code`, `abrir`, `vscode` | Abre un repositorio en Visual Studio Code | `code mi-proyecto` |
+| **`/repos`** | `repos`, `listado`, `listar`, `lista`, `proyectos` | Muestra el catálogo visual de repositorios (clonados vs en la nube) | `/repos` o `dame un listado` |
+| **`/buscar`** | `buscar`, `search`, `find` | Búsqueda difusa e inteligente tolerante a faltas de ortografía | `/buscar peluza` o `buscar audio` |
+| **`/code`** | `code`, `abrir`, `vscode` | Abre un repositorio en Visual Studio Code (con fuzzy match) | `code mi-proyecto` o `abre peluza` |
 | **`/salud`** | `salud`, `status`, `estado` | Auditoría de salud local en ~1 segundo | `salud` o `salud fetch` |
 | **`/sync`** | `sync`, `sincronizar`, `pull` | Descarga cambios remotos lineales (`--ff-only`) | `sync` o `sync mi-organizacion` |
 | **`/push`** | `push`, `subir` | Sube a GitHub los commits locales pendientes | `push` |
