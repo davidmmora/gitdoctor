@@ -15,6 +15,8 @@ import sys
 import json
 import time
 import re
+import shutil
+import tempfile
 import difflib
 import getpass
 import subprocess
@@ -1420,9 +1422,31 @@ def inspect_single_repo(entry, repos_dir, with_fetch=False):
         "url": entry.get("url", "")
     }
 
-def audit_all_repos(repos_dir, catalog, with_fetch=False, max_workers=16, org_filter=None):
+def audit_all_repos(repos_dir, catalog, with_fetch=False, max_workers=16, org_filter=None, auto_reindex=True):
     """Audita los repositorios en paralelo ultra-rapido respetando filtros de organizacion"""
     t0 = time.time()
+
+    # Auto-escaneo preventivo si se detectan rutas invalidas en entradas previamente clonadas
+    if auto_reindex and catalog and repos_dir and os.path.isdir(repos_dir):
+        has_invalid_paths = False
+        for c in catalog:
+            rel_p = c.get("path", f"{c.get('group', 'Personal')}/{c.get('name', '')}").replace("/", os.sep)
+            full_p = os.path.join(repos_dir, rel_p)
+            if c.get("is_cloned", True) and not os.path.exists(full_p):
+                has_invalid_paths = True
+                break
+        if has_invalid_paths:
+            try:
+                reindex_and_sync_catalog(
+                    repos_dir=repos_dir,
+                    catalog=catalog,
+                    sync_remote_transfers=with_fetch,
+                    auto_move_physical=True,
+                    quiet=True
+                )
+            except Exception:
+                pass
+
     scoped_catalog = catalog
     if org_filter:
         scoped_catalog = [c for c in catalog if c.get("group") in org_filter]
@@ -2119,7 +2143,21 @@ def commit_single_repo(repos_dir, catalog, repo_name, message):
 def sync_all_repos(repos_dir, catalog, auto_pull=True, auto_clone=True, org_filter=None):
     """Sincroniza y descarga actualizaciones en paralelo de forma segura"""
     print(f"\n{C_CYAN}[*] Iniciando sincronizacion paralela de repositorios...{C_RESET}")
-    audit = audit_all_repos(repos_dir, catalog, with_fetch=True, org_filter=org_filter)
+    # Auto-reindexar antes de clonar/pull para detectar repos movidos en disco o transferidos en GitHub
+    try:
+        reindex_res = reindex_and_sync_catalog(
+            repos_dir=repos_dir,
+            catalog=catalog,
+            sync_remote_transfers=True,
+            auto_move_physical=True,
+            quiet=True
+        )
+        if reindex_res.get("physical_moves") or reindex_res.get("relocated_repos"):
+            moved_total = len(reindex_res.get("physical_moves", [])) + len(reindex_res.get("relocated_repos", []))
+            print(f"  {C_GREEN}[AUTO-REINDEX] Se detectaron y actualizaron {moved_total} repositorio(s) reubicado(s) antes de sincronizar.{C_RESET}")
+    except Exception:
+        pass
+    audit = audit_all_repos(repos_dir, catalog, with_fetch=True, org_filter=org_filter, auto_reindex=False)
 
     cloned = []
     if auto_clone and audit["not_cloned"]:
@@ -2538,6 +2576,656 @@ def start_watchdog_loop(repos_dir, catalog, interval_seconds=300, send_notificat
         print(f"\n{C_YELLOW}[*] Modo Vigilante pausado. Volviendo al asistente.{C_RESET}\n")
 
 # ==============================================================================
+# AUTO-DESCUBRIMIENTO, REINDEXACION Y RECONCILIACION FISICA/REMOTA DEL CATALOGO
+# ==============================================================================
+IGNORED_SCAN_DIRS = {
+    "node_modules", ".cache", ".sync", "_sync", "_gitdoctor", "gitdoctor",
+    "repos-sync", ".venv", "venv", "env", "virtualenv", "dist", "build",
+    ".next", ".turbo", "__pycache__", ".firebase", ".vscode", ".idea",
+    "target", "out", "coverage", ".gradle", ".pytest_cache", ".mypy_cache"
+}
+
+def _read_git_config_remote(repo_path):
+    """Lee la URL remota origin desde git o directamente desde .git/config como fallback rapido."""
+    remote = run_cmd(["git", "remote", "get-url", "origin"], cwd=repo_path, timeout=5)
+    if remote:
+        return remote
+    cfg_path = os.path.join(repo_path, ".git", "config")
+    if os.path.isfile(cfg_path):
+        try:
+            with open(cfg_path, "r", encoding="utf-8", errors="ignore") as f:
+                in_origin = False
+                for line in f:
+                    s = line.strip()
+                    if s.startswith("[") and s.endswith("]"):
+                        in_origin = (s.lower() == '[remote "origin"]')
+                    elif in_origin and s.lower().startswith("url"):
+                        parts = s.split("=", 1)
+                        if len(parts) == 2:
+                            return parts[1].strip()
+        except Exception:
+            pass
+    return ""
+
+def _extract_repo_slug_and_owner(url):
+    """Extrae (owner, repo_name) normalizados desde una URL Git (HTTPS o SSH)."""
+    if not url:
+        return "", ""
+    u = normalize_url(url)
+    for prefix in ("https://github.com/", "https://gitlab.com/", "https://bitbucket.org/"):
+        if u.startswith(prefix):
+            rest = u[len(prefix):].strip("/")
+            parts = [p for p in rest.split("/") if p]
+            if len(parts) >= 2:
+                return parts[0], parts[-1]
+    parts = [p for p in re.split(r"[:/]", u) if p]
+    if len(parts) >= 2:
+        return parts[-2], parts[-1]
+    return "", ""
+
+def scan_local_disk_repos(repos_dir, script_dir=None, max_depth=3):
+    """
+    Escanea recursivamente el directorio raiz de repositorios (hasta max_depth niveles)
+    buscando carpetas que contengan un directorio o archivo `.git`.
+    Ignora carpetas del sistema, temporales, caches y la propia instalacion de GitDoctor.
+    """
+    if script_dir is None:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+
+    discovered = []
+    if not repos_dir or not os.path.isdir(repos_dir):
+        return discovered
+
+    repos_dir_abs = os.path.abspath(repos_dir)
+
+    def _walk(current_dir, depth):
+        if depth > max_depth:
+            return
+        try:
+            entries = sorted(os.scandir(current_dir), key=lambda e: e.name.lower())
+        except Exception:
+            return
+
+        for entry in entries:
+            try:
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+            except Exception:
+                continue
+
+            name = entry.name
+            if name.startswith(".") or name.lower() in IGNORED_SCAN_DIRS:
+                continue
+
+            full_path = os.path.abspath(entry.path)
+            if is_gitdoctor_path(full_path, script_dir):
+                continue
+
+            git_marker = os.path.join(full_path, ".git")
+            if os.path.isdir(git_marker) or os.path.isfile(git_marker):
+                rel_path = os.path.relpath(full_path, repos_dir_abs).replace("\\", "/")
+                rel_parts = [p for p in rel_path.split("/") if p]
+                repo_name = rel_parts[-1] if rel_parts else name
+                group = rel_parts[0] if len(rel_parts) >= 2 else "Personal"
+
+                remote_url = _read_git_config_remote(full_path)
+                norm_remote = normalize_url(remote_url)
+                if norm_remote.endswith("/gitdoctor") or norm_remote.endswith("/repos-sync"):
+                    continue
+
+                branch = run_cmd(["git", "branch", "--show-current"], cwd=full_path, timeout=5)
+                if not branch:
+                    branch = run_cmd(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=full_path, timeout=5) or "main"
+                head_commit = run_cmd(["git", "rev-parse", "--short", "HEAD"], cwd=full_path, timeout=5) or ""
+
+                discovered.append({
+                    "name": repo_name,
+                    "group": group,
+                    "is_loose_root": (len(rel_parts) == 1),
+                    "path": rel_path,
+                    "full_path": full_path,
+                    "url": remote_url,
+                    "norm_url": norm_remote,
+                    "branch": branch,
+                    "head_commit": head_commit
+                })
+                # No descender dentro de un repositorio Git ya encontrado
+                continue
+
+            if depth < max_depth:
+                _walk(full_path, depth + 1)
+
+    _walk(repos_dir_abs, 1)
+    return discovered
+
+def _fetch_github_remote_org_map(gh_info=None, active_orgs=None):
+    """
+    Construye un mapa {repo_name_lower: [{group, url, name, owner, defaultBranch}, ...]} consultando
+    las organizaciones de GitHub para detectar si un repositorio fue transferido de organizacion en GitHub,
+    diferenciando repositorios homonimos legitimos en distintas organizaciones.
+    """
+    remote_map = {}
+    if not shutil.which("gh"):
+        return remote_map
+
+    if gh_info is None:
+        gh_info = get_github_status()
+    if not gh_info.get("logged_in"):
+        return remote_map
+
+    user_login = (gh_info.get("user") or "").lower()
+    orgs_to_query = ["Personal"]
+    for o in (active_orgs or gh_info.get("orgs") or []):
+        if o not in orgs_to_query:
+            orgs_to_query.append(o)
+
+    def _query_org(org_name):
+        try:
+            if org_name == "Personal":
+                cmd = ["gh", "repo", "list", "--limit", "300", "--json", "name,nameWithOwner,url,defaultBranchRef,owner"]
+            else:
+                cmd = ["gh", "repo", "list", org_name, "--limit", "300", "--json", "name,nameWithOwner,url,defaultBranchRef,owner"]
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=15)
+            if res.returncode == 0:
+                return org_name, json.loads(res.stdout.decode("utf-8", errors="replace"))
+        except Exception:
+            pass
+        return org_name, []
+
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(orgs_to_query)))) as ex:
+        results = list(ex.map(_query_org, orgs_to_query))
+
+    for org_name, repo_list in results:
+        for r in repo_list:
+            r_name = r.get("name", "")
+            if not r_name or r_name.lower() in ("gitdoctor", "repos-sync", "_sync"):
+                continue
+            owner_login = (r.get("owner", {}) or {}).get("login", "") or org_name
+            resolved_group = "Personal" if owner_login.lower() in (user_login, "davidmmora", "personal") else owner_login
+            def_branch = (r.get("defaultBranchRef") or {}).get("name") or "main"
+            remote_Url = r.get("url", "")
+            if remote_Url and not remote_Url.endswith(".git"):
+                remote_Url = remote_Url + ".git"
+            item_meta = {
+                "name": r_name,
+                "group": resolved_group,
+                "owner": owner_login,
+                "url": remote_Url,
+                "norm_url": normalize_url(remote_Url),
+                "defaultBranch": def_branch
+            }
+            remote_map.setdefault(r_name.lower(), []).append(item_meta)
+    return remote_map
+
+def _atomic_write_json(target_path, data):
+    """Escribe un archivo JSON de forma atomica con sangria limpia de 4 espacios y UTF-8."""
+    parent_dir = os.path.dirname(os.path.abspath(target_path))
+    os.makedirs(parent_dir, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".gitdoc_cat_", suffix=".json.tmp", dir=parent_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:
+            json.dump(data, tmp_file, indent=4, ensure_ascii=False)
+            tmp_file.write("\n")
+        os.replace(tmp_path, target_path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+        raise
+
+def reindex_and_sync_catalog(
+    repos_dir,
+    catalog=None,
+    catalog_file=None,
+    script_dir=None,
+    sync_remote_transfers=True,
+    auto_move_physical=True,
+    prune_deleted_remotes=False,
+    gh_info=None,
+    active_orgs=None,
+    interactive=True,
+    quiet=False
+):
+    """
+    Escanea recursivamente el disco (`D:\\Repos` o `~/Repos`), detecta repositorios que fueron:
+      1) Transferidos de organizacion en GitHub (moviendo fisicamente su carpeta local y actualizando `git remote`),
+      2) Movidos manualmente de carpeta o renombrados en el disco local,
+      3) Agregados manualmente en disco sin estar en el catalogo,
+      4) Eliminados del disco (marcando `is_cloned: False` o limpiando huerfanos),
+    y sincroniza de forma atomica el catalogo (`repos.local.json` / `_sync/repos.json`).
+
+    Retorna un diccionario diagnostico con:
+      - relocated_repos: lista de repositorios reubicados (origen -> destino)
+      - physical_moves: lista de carpetas movidas fisicamente en disco tras cambio en GitHub
+      - newly_discovered: lista de nuevos repositorios descubiertos e indexados
+      - orphaned_cleaned: lista de rutas huerfanas actualizadas/limpiadas
+      - active_total: total de repositorios activos en el catalogo
+      - cloned_total: total de repositorios clonados fisicamente en disco
+      - catalog: lista actualizada en memoria
+    """
+    if script_dir is None:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+
+    if catalog_file is None:
+        cat_local = os.path.join(script_dir, "repos.local.json")
+        cat_master = os.path.join(script_dir, "repos.json")
+        catalog_file = cat_local if os.path.isfile(cat_local) else cat_master
+
+    if catalog is None:
+        catalog = []
+        if os.path.isfile(catalog_file):
+            try:
+                with open(catalog_file, "r", encoding="utf-8-sig") as f:
+                    catalog = json.load(f)
+            except Exception:
+                catalog = []
+
+    if not quiet:
+        print(f"\n{C_CYAN}================================================================{C_RESET}")
+        print(f"{C_WHITE}{C_BOLD}  🔍 GitDoctor -- Auto-Descubrimiento y Reindexacion Clinica   {C_RESET}")
+        print(f"{C_GRAY}  Escaneando disco (max 3 niveles): {repos_dir}{C_RESET}")
+        print(f"{C_CYAN}================================================================{C_RESET}")
+
+    # 1. Escaneo recursivo en disco (hasta 3 niveles)
+    disk_repos = scan_local_disk_repos(repos_dir, script_dir=script_dir, max_depth=3)
+
+    # 2. Deteccion de transferencias de organizacion en GitHub -> Movimiento fisico en disco
+    physical_moves = []
+    remote_org_map = {}
+    if sync_remote_transfers:
+        if not quiet:
+            print(f"{C_CYAN}[*] Verificando posibles transferencias de organizacion en GitHub...{C_RESET}")
+        remote_org_map = _fetch_github_remote_org_map(gh_info=gh_info, active_orgs=active_orgs)
+
+        if remote_org_map:
+            for d_repo in disk_repos:
+                r_key = d_repo["name"].lower()
+                candidates = remote_org_map.get(r_key, [])
+                if not candidates:
+                    continue
+
+                current_group = d_repo["group"]
+                # Si el repositorio NO esta suelto en la raiz y sigue existiendo en su organizacion actual en GitHub, no fue transferido
+                if (not d_repo.get("is_loose_root")) and any(c["group"].lower() == current_group.lower() for c in candidates):
+                    continue
+
+                # Si ya existe otra carpeta en disco con el mismo nombre dentro de target_group (y no es esta misma), no mover encima
+                if any(
+                    other["full_path"] != d_repo["full_path"]
+                    and other["name"].lower() == r_key
+                    and other["group"].lower() == candidates[0]["group"].lower()
+                    for other in disk_repos
+                ):
+                    continue
+
+                # Cuando existe en exactamente una organizacion en GitHub (o estaba suelto en la raiz), moverlo automaticamente
+                if len(candidates) == 1:
+                    gh_meta = candidates[0]
+                    target_group = gh_meta["group"]
+
+                    if target_group.lower() != current_group.lower() or d_repo.get("is_loose_root"):
+                        new_rel_path = f"{target_group}/{d_repo['name']}"
+                        new_full_path = os.path.abspath(os.path.join(repos_dir, target_group, d_repo["name"]))
+                        old_full_path = d_repo["full_path"]
+                        old_rel_path = d_repo["path"]
+
+                        if auto_move_physical and os.path.abspath(old_full_path) != new_full_path:
+                            if not os.path.exists(new_full_path):
+                                try:
+                                    os.makedirs(os.path.dirname(new_full_path), exist_ok=True)
+                                    shutil.move(old_full_path, new_full_path)
+                                    # Actualizar el remote origin local para apuntar a la nueva organizacion
+                                    if gh_meta.get("url"):
+                                        run_cmd(["git", "remote", "set-url", "origin", gh_meta["url"]], cwd=new_full_path, timeout=5)
+                                    d_repo["group"] = target_group
+                                    d_repo["is_loose_root"] = False
+                                    d_repo["path"] = new_rel_path
+                                    d_repo["full_path"] = new_full_path
+                                    if gh_meta.get("url"):
+                                        d_repo["url"] = gh_meta["url"]
+                                        d_repo["norm_url"] = gh_meta["norm_url"]
+                                    physical_moves.append({
+                                        "name": d_repo["name"],
+                                        "from_path": old_rel_path,
+                                        "to_path": new_rel_path,
+                                        "new_url": gh_meta.get("url", d_repo["url"])
+                                    })
+                                    # Limpiar carpeta de organizacion anterior si quedo vacia
+                                    old_parent = os.path.dirname(old_full_path)
+                                    if os.path.abspath(old_parent) != os.path.abspath(repos_dir) and os.path.isdir(old_parent) and not os.listdir(old_parent):
+                                        try:
+                                            os.rmdir(old_parent)
+                                        except Exception:
+                                            pass
+                                except Exception as e:
+                                    if not quiet:
+                                        print(f"  {C_RED}[!] No se pudo mover fisicamente {old_rel_path} -> {new_rel_path}: {e}{C_RESET}")
+                            else:
+                                if not quiet:
+                                    print(f"  {C_YELLOW}[!] Destino ya existe en disco ({new_rel_path}), se conserva ubicacion actual.{C_RESET}")
+
+    # 2.5. Si hay un repositorio local que NO existe en ninguna organizacion de GitHub (sin remote o no subido aun)
+    #      o esta suelto en la raiz sin organizacion, preguntar interactivamente a que org moverlo y si subirlo a GitHub.
+    published_to_github = []
+    if interactive and not quiet:
+        org_choices = list(active_orgs) if active_orgs else list(DEFAULT_ORGS)
+        if "Personal" not in org_choices:
+            org_choices.append("Personal")
+
+        for d_repo in disk_repos:
+            r_key = d_repo["name"].lower()
+            in_github = bool(remote_org_map.get(r_key)) if remote_org_map else bool(d_repo.get("url"))
+            is_loose = d_repo.get("is_loose_root", False)
+            has_remote = bool(d_repo.get("url"))
+
+            # Caso A: Esta suelto en la raiz (ej. D:\Repos\mi-proyecto) y no estaba en GitHub
+            was_loose = is_loose
+            if is_loose:
+                print(f"\n{C_YELLOW}[!] El repositorio '{d_repo['name']}' esta suelto en la raiz ({d_repo['path']}) y no pertenece a ninguna organizacion.{C_RESET}")
+                for idx, o_name in enumerate(org_choices, 1):
+                    print(f"    [{idx:2d}] {o_name}")
+                print(f"    [ 0] Omitir movimiento")
+                try:
+                    ans_org = input(f"  {C_BOLD}¿A que organizacion deseas mover '{d_repo['name']}'? (Enter para Personal): {C_RESET}").strip()
+                except (EOFError, KeyboardInterrupt):
+                    ans_org = "0"
+
+                chosen_org = None
+                if ans_org == "":
+                    chosen_org = "Personal"
+                elif ans_org.isdigit() and 1 <= int(ans_org) <= len(org_choices):
+                    chosen_org = org_choices[int(ans_org) - 1]
+
+                if chosen_org:
+                    new_rel = f"{chosen_org}/{d_repo['name']}"
+                    new_full = os.path.abspath(os.path.join(repos_dir, chosen_org, d_repo["name"]))
+                    if not os.path.exists(new_full):
+                        try:
+                            os.makedirs(os.path.dirname(new_full), exist_ok=True)
+                            shutil.move(d_repo["full_path"], new_full)
+                            physical_moves.append({
+                                "name": d_repo["name"],
+                                "from_path": d_repo["path"],
+                                "to_path": new_rel,
+                                "new_url": d_repo.get("url", "")
+                            })
+                            d_repo["group"] = chosen_org
+                            d_repo["path"] = new_rel
+                            d_repo["full_path"] = new_full
+                            d_repo["is_loose_root"] = False
+                            print(f"  {C_GREEN}[OK] Movido fisicamente a: {new_rel}{C_RESET}")
+                        except Exception as e:
+                            print(f"  {C_RED}[!] Error al mover carpeta: {e}{C_RESET}")
+
+            # Caso B: No tiene remote configurado (o estaba suelto sin existir en GitHub) -> preguntar si lo sube a GitHub
+            if (not has_remote) or (was_loose and remote_org_map and not in_github):
+                target_org = d_repo["group"]
+                print(f"\n{C_YELLOW}[?] El repositorio local '{target_org}/{d_repo['name']}' no existe aun en GitHub en ninguna organizacion.{C_RESET}")
+                try:
+                    ans_pub = input(f"  {C_BOLD}¿Deseas crearlo y subirlo a GitHub (privado) bajo '{target_org}/{d_repo['name']}' ahora? [S/n]: {C_RESET}").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    ans_pub = "n"
+
+                if ans_pub in ("", "s", "si", "y", "yes"):
+                    # Asegurar que tenga al menos un commit antes de hacer push
+                    if not d_repo.get("head_commit"):
+                        subprocess.run(["git", "add", "-A"], cwd=d_repo["full_path"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        commit_msg = f"chore: initial commit\n\n{COPILOT_TRAILER}"
+                        subprocess.run(["git", "commit", "-m", commit_msg], cwd=d_repo["full_path"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        d_repo["head_commit"] = run_cmd(["git", "rev-parse", "--short", "HEAD"], cwd=d_repo["full_path"], timeout=5) or ""
+
+                    gh_target = d_repo["name"] if target_org.lower() == "personal" else f"{target_org}/{d_repo['name']}"
+                    # Si ya tenia un remote origin huerfano, removerlo antes de --remote=origin
+                    if has_remote:
+                        subprocess.run(["git", "remote", "remove", "origin"], cwd=d_repo["full_path"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+                    print(f"  {C_CYAN}[*] Creando y subiendo repositorio privado '{gh_target}' en GitHub...{C_RESET}")
+                    create_cmd = [
+                        "gh", "repo", "create", gh_target,
+                        "--private",
+                        f"--source={d_repo['full_path']}",
+                        "--remote=origin",
+                        "--push"
+                    ]
+                    res_pub = subprocess.run(create_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    if res_pub.returncode == 0:
+                        created_url = _read_git_config_remote(d_repo["full_path"])
+                        if created_url and not created_url.endswith(".git"):
+                            created_url = created_url + ".git"
+                        d_repo["url"] = created_url
+                        d_repo["norm_url"] = normalize_url(created_url)
+                        published_to_github.append(f"{target_org}/{d_repo['name']}")
+                        print(f"  {C_GREEN}[OK] ¡Subido exitosamente a GitHub!: {created_url}{C_RESET}")
+                    else:
+                        err_msg = res_pub.stderr.decode("utf-8", errors="ignore").strip()
+                        print(f"  {C_RED}[ERROR] No se pudo subir a GitHub: {err_msg}{C_RESET}")
+
+    # 3. Indexar repositorios encontrados en disco por URL normalizada, por (org, nombre) y por nombre
+    disk_by_url = {}
+    disk_by_org_name = {}
+    disk_by_name = {}
+    for d in disk_repos:
+        if d["norm_url"]:
+            disk_by_url[d["norm_url"]] = d
+        disk_by_org_name[(d["group"].lower(), d["name"].lower())] = d
+        disk_by_name.setdefault(d["name"].lower(), []).append(d)
+
+    relocated_repos = []
+    newly_discovered = []
+    orphaned_cleaned = []
+    matched_disk_paths = set()
+    updated_catalog = []
+
+    # Filtrar entradas de plantilla dummy si ya hay repos reales en disco
+    dummy_names = {"mi-proyecto-backend", "mi-proyecto-frontend", "mi-libreria-utilidades"}
+    has_real_repos = any(d["name"] not in dummy_names for d in disk_repos)
+
+    for entry in catalog:
+        e_name = entry.get("name", "")
+        if not e_name or e_name.lower() in ("gitdoctor", "repos-sync", "_sync"):
+            continue
+        if has_real_repos and e_name in dummy_names and os.path.basename(catalog_file) == "repos.local.json":
+            continue
+
+        e_url = entry.get("url", "")
+        e_norm_url = normalize_url(e_url)
+        old_group = entry.get("group", "Personal")
+        old_path = entry.get("path", f"{old_group}/{e_name}").replace("\\", "/")
+
+        # Buscar coincidencia en disco: 1° por (org, nombre) exacto en disco, 2° por URL remota, 3° por nombre unico no asignado
+        matched_disk = None
+        if (old_group.lower(), e_name.lower()) in disk_by_org_name:
+            cand = disk_by_org_name[(old_group.lower(), e_name.lower())]
+            if cand["full_path"] not in matched_disk_paths:
+                matched_disk = cand
+        if not matched_disk and e_norm_url and e_norm_url in disk_by_url and disk_by_url[e_norm_url]["full_path"] not in matched_disk_paths:
+            matched_disk = disk_by_url[e_norm_url]
+        if not matched_disk and e_name.lower() in disk_by_name:
+            unmatched_cands = [c for c in disk_by_name[e_name.lower()] if c["full_path"] not in matched_disk_paths]
+            if len(unmatched_cands) == 1:
+                matched_disk = unmatched_cands[0]
+
+        if matched_disk:
+            matched_disk_paths.add(matched_disk["full_path"])
+            new_path = matched_disk["path"]
+            new_group = matched_disk["group"]
+            new_url = matched_disk["url"] or e_url
+
+            # Si el usuario movio la carpeta manualmente en el disco (ej. Personal/x -> th-mex/x)
+            # y la URL remota en GitHub confirma que pertenece a new_group, actualizar git remote
+            gh_cands = remote_org_map.get(e_name.lower(), [])
+            gh_match = next((c for c in gh_cands if c["group"].lower() == new_group.lower()), None)
+            if gh_match and gh_match.get("url") and normalize_url(gh_match["url"]) != normalize_url(new_url):
+                new_url = gh_match["url"]
+                run_cmd(["git", "remote", "set-url", "origin", new_url], cwd=matched_disk["full_path"], timeout=5)
+
+            if old_path != new_path or old_group != new_group:
+                relocated_repos.append({
+                    "name": matched_disk["name"],
+                    "from_group": old_group,
+                    "to_group": new_group,
+                    "from_path": old_path,
+                    "to_path": new_path,
+                    "url": new_url
+                })
+
+            new_entry = dict(entry)
+            new_entry["name"] = matched_disk["name"]
+            new_entry["group"] = new_group
+            new_entry["path"] = new_path
+            new_entry["url"] = new_url
+            new_entry["defaultBranch"] = entry.get("defaultBranch") or matched_disk["branch"] or "main"
+            new_entry["activeBranch"] = matched_disk["branch"]
+            if matched_disk["head_commit"]:
+                new_entry["headCommit"] = matched_disk["head_commit"]
+            new_entry["is_cloned"] = True
+            updated_catalog.append(new_entry)
+        else:
+            # Ruta no encontrada en disco (Huerfana / No clonada)
+            gh_cands = remote_org_map.get(e_name.lower(), [])
+            gh_meta = next((c for c in gh_cands if c["group"].lower() == old_group.lower()), None)
+            if not gh_meta and len(gh_cands) == 1:
+                gh_meta = gh_cands[0]
+
+            if prune_deleted_remotes and remote_org_map and not gh_cands:
+                orphaned_cleaned.append({
+                    "name": e_name,
+                    "old_path": old_path,
+                    "action": "removed_missing_remote"
+                })
+                continue
+
+            new_entry = dict(entry)
+            was_marked_cloned = entry.get("is_cloned", True)
+            if gh_meta and gh_meta["group"].lower() != old_group.lower():
+                new_rel = f"{gh_meta['group']}/{gh_meta['name']}"
+                relocated_repos.append({
+                    "name": gh_meta["name"],
+                    "from_group": old_group,
+                    "to_group": gh_meta["group"],
+                    "from_path": old_path,
+                    "to_path": new_rel,
+                    "url": gh_meta["url"]
+                })
+                new_entry["group"] = gh_meta["group"]
+                new_entry["path"] = new_rel
+                new_entry["url"] = gh_meta["url"]
+
+            new_entry["is_cloned"] = False
+            if was_marked_cloned:
+                orphaned_cleaned.append({
+                    "name": e_name,
+                    "old_path": old_path,
+                    "action": "marked_uncloned"
+                })
+            updated_catalog.append(new_entry)
+
+    # 4. Agregar nuevos repositorios descubiertos en disco que no estaban en el catalogo
+    for d in disk_repos:
+        if d["full_path"] not in matched_disk_paths:
+            default_b = d["branch"] if d["branch"] and d["branch"] != "(detached)" else "main"
+            new_item = {
+                "name": d["name"],
+                "group": d["group"],
+                "path": d["path"],
+                "url": d["url"] or f"https://github.com/{d['group']}/{d['name']}.git",
+                "defaultBranch": default_b,
+                "activeBranch": d["branch"],
+                "is_cloned": True
+            }
+            if d["head_commit"]:
+                new_item["headCommit"] = d["head_commit"]
+            updated_catalog.append(new_item)
+            newly_discovered.append({
+                "name": d["name"],
+                "group": d["group"],
+                "path": d["path"],
+                "url": new_item["url"],
+                "branch": d["branch"]
+            })
+
+        # deduplicar entradas del catalogo que apunten a la misma ruta relativa final
+    deduped_catalog = []
+    seen_rel_paths = set()
+    for item in updated_catalog:
+        rp = item.get("path", "").lower()
+        if rp in seen_rel_paths:
+            continue
+        seen_rel_paths.add(rp)
+        deduped_catalog.append(item)
+    updated_catalog = deduped_catalog
+
+    # Ordenar catalogo limpiamente por organizacion y nombre
+    updated_catalog.sort(key=lambda x: (x.get("group", "").lower(), x.get("name", "").lower()))
+
+    # 5. Persistencia atomica en disco
+    # Si el archivo objetivo era repos.json (plantilla publica) y descubrimos repos reales del usuario,
+    # guardamos en repos.local.json para respetar la privacidad de GitDoctor.
+    target_save_file = catalog_file
+    if os.path.basename(catalog_file) == "repos.json" and has_real_repos:
+        target_save_file = os.path.join(script_dir, "repos.local.json")
+
+    _atomic_write_json(target_save_file, updated_catalog)
+
+    # Si existe un subdirectorio _sync/repos.json legacy, sincronizarlo atomicamente tambien
+    legacy_sync_cat = os.path.join(repos_dir, "_sync", "repos.json")
+    if os.path.isfile(legacy_sync_cat) and os.path.abspath(legacy_sync_cat) != os.path.abspath(os.path.join(script_dir, "repos.json")):
+        try:
+            _atomic_write_json(legacy_sync_cat, updated_catalog)
+        except Exception:
+            pass
+
+    # Actualizar la lista `catalog` in-place para que la sesion activa del CLI/Agente vea los cambios de inmediato
+    catalog.clear()
+    catalog.extend(updated_catalog)
+
+    cloned_total = sum(1 for c in updated_catalog if c.get("is_cloned", False))
+    active_total = len(updated_catalog)
+
+    # 6. Imprimir resumen diagnostico clinico
+    if not quiet:
+        print(f"\n{C_BOLD}📋 RESUMEN DIAGNOSTICO DE REINDEXACION:{C_RESET}")
+        if physical_moves:
+            print(f"\n  {C_MAGENTA}🚚 Carpetas Movidas Fisicamente (Transferencia detectada en GitHub): ({len(physical_moves)}){C_RESET}")
+            for pm in physical_moves:
+                print(f"    * {C_BOLD}{pm['name']}{C_RESET}: {C_YELLOW}{pm['from_path']}{C_RESET} --> {C_GREEN}{pm['to_path']}{C_RESET}")
+        if relocated_repos:
+            print(f"\n  {C_CYAN}🔄 Repositorios Reubicados en Catalogo: ({len(relocated_repos)}){C_RESET}")
+            for rr in relocated_repos:
+                print(f"    * {C_BOLD}{rr['name']}{C_RESET}: {C_YELLOW}{rr['from_path']}{C_RESET} --> {C_GREEN}{rr['to_path']}{C_RESET}")
+        if newly_discovered:
+            print(f"\n  {C_GREEN}✨ Nuevos Repositorios Descubiertos e Indexados: ({len(newly_discovered)}){C_RESET}")
+            for nd in newly_discovered:
+                print(f"    * {C_BOLD}{nd['path']}{C_RESET} [{nd['branch']}] ({nd['url']})")
+        if orphaned_cleaned:
+            print(f"\n  {C_YELLOW}🧹 Rutas Huerfanas / No Clonadas Actualizadas: ({len(orphaned_cleaned)}){C_RESET}")
+            for oc in orphaned_cleaned[:15]:
+                print(f"    * {oc['old_path']} -> {oc['action']}")
+            if len(orphaned_cleaned) > 15:
+                print(f"    * ... y {len(orphaned_cleaned) - 15} mas.")
+
+        if not (physical_moves or relocated_repos or newly_discovered):
+            print(f"  {C_GREEN}[OK] El catalogo y las carpetas en disco estan 100% sincronizados.{C_RESET}")
+
+        print(f"\n  * {C_BOLD}Catalogo actualizado:{C_RESET} {os.path.basename(target_save_file)}")
+        print(f"  * {C_BOLD}Repositorios clonados en disco:{C_RESET} {C_GREEN}{cloned_total}{C_RESET}")
+        print(f"  * {C_BOLD}Total de repositorios activos en catalogo:{C_RESET} {C_CYAN}{active_total}{C_RESET}\n")
+
+    return {
+        "success": True,
+        "catalog_file": target_save_file,
+        "physical_moves": physical_moves,
+        "relocated_repos": relocated_repos,
+        "newly_discovered": newly_discovered,
+        "published_to_github": published_to_github,
+        "orphaned_cleaned": orphaned_cleaned,
+        "cloned_total": cloned_total,
+        "active_total": active_total
+    }
+
+# ==============================================================================
 # TRIAGE CON GEMINI AI (CARPETAS NUEVAS O HUERFANAS)
 # ==============================================================================
 def triage_unclassified_folders(repos_dir, catalog, catalog_file, api_key, active_orgs):
@@ -2628,6 +3316,7 @@ TUS CAPACIDADES MEDIANTE HERRAMIENTAS:
 18. `run_onboarding`: Diagnostica y reorganiza carpetas existentes en la raiz hacia las 10 organizaciones oficiales.
 19. `list_repositories`: Lista y filtra los repositorios del catalogo y del equipo (clonados vs en la nube). Usalo SIEMPRE que el usuario pida un listado, ver repositorios, o consultar que proyectos existen.
 20. `search_repositories`: Busca repositorios con tolerancia a errores tipograficos, faltas de ortografia y nombres aproximados (fuzzy matching).
+21. `reindex_catalog`: Escanea recursivamente el disco (`D:\\Repos` o `~/Repos`), detecta repositorios movidos de carpeta, transferidos de organizacion en GitHub (moviendo fisicamente sus archivos locales y actualizando su remote), agregados manualmente o eliminados, y sincroniza el catalogo maestro (`repos.local.json` / `repos.json`).
 
 REGLAS DE INTERACCION:
 - Responde siempre de forma concisa, profesional, clara, cercana y en espanol con tono de Medico DevOps de cabecera.
@@ -2938,6 +3627,23 @@ GEMINI_TOOLS = [
                         }
                     },
                     "required": ["query"]
+                }
+            },
+            {
+                "name": "reindex_catalog",
+                "description": "Auto-descubre y reindexa el catalogo de repositorios: escanea el disco recursivamente, detecta repositorios movidos en disco o transferidos de organizacion en GitHub (moviendo sus archivos fisicos y actualizando su remote origin), registra nuevos repos locales y limpia rutas huerfanas.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "sync_remote_transfers": {
+                            "type": "BOOLEAN",
+                            "description": "Si es True (por defecto), consulta GitHub para detectar si algun repositorio cambio de organizacion y mueve fisicamente su carpeta local."
+                        },
+                        "auto_move_physical": {
+                            "type": "BOOLEAN",
+                            "description": "Si es True (por defecto), mueve automaticamente la carpeta fisica del repositorio en disco hacia la nueva organizacion detectada."
+                        }
+                    }
                 }
             }
         ]
@@ -3459,6 +4165,23 @@ def execute_tool_call(tool_name, args, repos_dir, catalog, catalog_file, api_key
         script_dir = os.path.dirname(os.path.abspath(__file__))
         return interactive_manage_catalog_vault(script_dir, local_cfg, gh_info, action=act, param=g_id, repos_dir=repos_dir)
 
+    elif tool_name == "reindex_catalog":
+        sync_remote = args.get("sync_remote_transfers", True)
+        auto_move = args.get("auto_move_physical", True)
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        gh_info = get_github_status() if sync_remote else None
+        return reindex_and_sync_catalog(
+            repos_dir=repos_dir,
+            catalog=catalog,
+            catalog_file=catalog_file,
+            script_dir=script_dir,
+            sync_remote_transfers=sync_remote,
+            auto_move_physical=auto_move,
+            gh_info=gh_info,
+            active_orgs=active_orgs,
+            quiet=False
+        )
+
     return {"error": f"Herramienta desconocida: {tool_name}"}
 
 # ==============================================================================
@@ -3969,6 +4692,7 @@ def print_helpme_commands():
     print(f"{C_BOLD}{C_CYAN}🔄 SINCRONIZACION Y GESTION DE CODIGO:{C_RESET}")
     print(f"  * {C_WHITE}/repos{C_RESET} [filtro|org]         : Listado completo de proyectos con estado (clonados en disco vs en la nube).")
     print(f"  * {C_WHITE}/buscar <termino>{C_RESET}         : Busqueda difusa e inteligente con tolerancia a faltas de ortografia.")
+    print(f"  * {C_WHITE}/reindex{C_RESET} (o {C_WHITE}reindex{C_RESET})       : Auto-escanea el disco y GitHub; mueve carpetas si cambiaron de org y sincroniza el catalogo.")
     print(f"  * {C_WHITE}/catalogo{C_RESET} [push|pull|status]: Gestiona tu Boveda Privada (Gist Secreto) para compartir repos entre Windows y Mac.")
     print(f"  * {C_WHITE}/sync{C_RESET} [org]               : Descarga cambios remotos en paralelo con pull lineal (--ff-only).")
     print(f"  * {C_WHITE}/push{C_RESET} [repo|all]          : Sube a GitHub los commits locales que van adelante.")
@@ -4119,6 +4843,11 @@ COMMAND_MAP = {
     "buscar": "/buscar",
     "search": "/buscar",
     "find": "/buscar",
+    "reindex": "/reindex",
+    "reindexar": "/reindex",
+    "reconciliar": "/reindex",
+    "escanear": "/reindex",
+    "autodescubrir": "/reindex",
     "ayuda": "/ayuda",
     "help": "/ayuda",
     "helpme": "/ayuda",
@@ -4135,7 +4864,7 @@ CANONICAL_SLASH_COMMANDS = [
     "/gitflow", "/onboarding", "/limpiar", "/disco", "/sync", "/push", "/commit", "/apagar",
     "/vigilante", "/github", "/perfiles", "/catalogo", "/login", "/switch", "/logout", "/git-id", "/dir",
     "/importar-github", "/publico", "/ia", "/set-key", "/ayuda", "/helpme", "/salir",
-    "/repos", "/buscar"
+    "/repos", "/buscar", "/reindex"
 ]
 
 def resolve_user_command(user_input):
@@ -4409,6 +5138,21 @@ def dispatch_single_command(canon_cmd, rest, repos_dir, catalog, catalog_file, g
     elif canon_cmd == "/importar-github":
         import_repos_from_github(script_dir, gh_info)
 
+    elif canon_cmd == "/reindex":
+        no_remote = "--local" in rest.lower() or "local" in rest.lower()
+        no_move = "--no-move" in rest.lower()
+        reindex_and_sync_catalog(
+            repos_dir=repos_dir,
+            catalog=catalog,
+            catalog_file=catalog_file,
+            script_dir=script_dir,
+            sync_remote_transfers=(not no_remote),
+            auto_move_physical=(not no_move),
+            gh_info=gh_info,
+            active_orgs=all_known_orgs,
+            quiet=False
+        )
+
     elif canon_cmd == "/publico":
         prepare_for_public_repo(script_dir)
 
@@ -4441,10 +5185,14 @@ def main():
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
-    # Auto-actualizacion silenciosa de _sync si hay conexion con origin
+    # Auto-actualizacion de GitDoctor al iniciar si hay cambios nuevos en origin
     if os.path.isdir(os.path.join(script_dir, ".git")):
         try:
-            subprocess.run(["git", "pull", "-q", "--ff-only"], cwd=script_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=4)
+            old_head = run_cmd(["git", "rev-parse", "--short", "HEAD"], cwd=script_dir, timeout=4)
+            subprocess.run(["git", "pull", "-q", "--ff-only"], cwd=script_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
+            new_head = run_cmd(["git", "rev-parse", "--short", "HEAD"], cwd=script_dir, timeout=4)
+            if old_head and new_head and old_head != new_head:
+                print(f"{C_GREEN}✨ [AUTO-UPDATE] GitDoctor se actualizo automaticamente ({old_head} -> {new_head}).{C_RESET}")
         except Exception:
             pass
 
@@ -4543,14 +5291,58 @@ def main():
         else:
             print(f"{C_YELLOW}[!] IA:{C_RESET} Modo Offline {C_GRAY}(Usa /set-key para Gemini o abre Ollama para IA local offline){C_RESET}")
 
-    # Auditoria inicial rapida (filtrada si hay orgs desactivadas)
+    # Revision y descarga automatica de cambios remotos al iniciar GitDoctor
     org_filter = enabled_orgs if disabled_orgs else None
-    init_audit = audit_all_repos(repos_dir, catalog, with_fetch=False, org_filter=org_filter)
+    print(f"\n{C_CYAN}[*] Revisando cambios remotos en tus repositorios y sincronizando al iniciar...{C_RESET}")
+    try:
+        startup_reindex = reindex_and_sync_catalog(
+            repos_dir=repos_dir,
+            catalog=catalog,
+            catalog_file=catalog_file,
+            script_dir=script_dir,
+            sync_remote_transfers=bool(gh_info.get("logged_in")),
+            auto_move_physical=True,
+            gh_info=gh_info,
+            active_orgs=all_known_orgs,
+            interactive=True,
+            quiet=True
+        )
+        if startup_reindex.get("physical_moves"):
+            for pm in startup_reindex["physical_moves"]:
+                print(f"  {C_MAGENTA}🚚 [AUTO-MOVE] '{pm['name']}' movido fisicamente: {pm['from_path']} -> {pm['to_path']}{C_RESET}")
+        if startup_reindex.get("newly_discovered"):
+            print(f"  {C_GREEN}✨ [AUTO-INDEX] {len(startup_reindex['newly_discovered'])} nuevo(s) repositorio(s) local(es) agregado(s) al catalogo.{C_RESET}")
+    except Exception:
+        pass
+
+    init_audit = audit_all_repos(repos_dir, catalog, with_fetch=True, org_filter=org_filter, auto_reindex=False)
+
+    # Si hay repositorios limpios con cambios pendientes en el remoto (BEHIND), descargarlos automaticamente
+    startup_behind = [r for r in init_audit.get("behind", []) if r.get("dirty_count", 0) == 0]
+    if startup_behind:
+        print(f"  {C_CYAN}⬇ Descargando actualizaciones de {len(startup_behind)} repositorio(s) con cambios nuevos...{C_RESET}")
+
+        def _startup_pull(repo_info):
+            res = subprocess.run(["git", "pull", "-q", "--ff-only"], cwd=repo_info["full_path"], stderr=subprocess.DEVNULL)
+            return repo_info, (res.returncode == 0)
+
+        pulled_names = []
+        with ThreadPoolExecutor(max_workers=16) as executor:
+            for r_info, ok in executor.map(_startup_pull, startup_behind):
+                if ok:
+                    pulled_names.append(f"{r_info['group']}/{r_info['name']}")
+
+        if pulled_names:
+            print(f"  {C_GREEN}[OK] Descargados automaticamente ({len(pulled_names)}): {', '.join(pulled_names)}{C_RESET}")
+            # Actualizar el estado en memoria de init_audit tras el pull exitoso
+            init_audit = audit_all_repos(repos_dir, catalog, with_fetch=False, org_filter=org_filter, auto_reindex=False)
+
     print_health_report(init_audit)
 
     print(f"{C_WHITE}Comandos principales de GitDoctor:{C_RESET}")
     print(f"  {C_BOLD}/repos{C_RESET} [filtro|org]        {C_GRAY}Listado completo de proyectos (clonados en disco vs en la nube){C_RESET}")
     print(f"  {C_BOLD}/buscar <termino>{C_RESET}         {C_GRAY}Busqueda inteligente con tolerancia a faltas de ortografia{C_RESET}")
+    print(f"  {C_BOLD}/reindex{C_RESET}                   {C_GRAY}Auto-escanea disco y GitHub; mueve carpetas si cambiaron de org y sincroniza catalogo{C_RESET}")
     print(f"  {C_BOLD}/salud 360{C_RESET} (o /seguridad)  {C_GRAY}Auditoria profunda: Secretos, API keys, Gitflow e higiene{C_RESET}")
     print(f"  {C_BOLD}/gitflow{C_RESET} [repo|all]        {C_GRAY}Auditar e implementar estrategia Gitflow (crea rama develop){C_RESET}")
     print(f"  {C_BOLD}/perfiles{C_RESET}                  {C_GRAY}Gestionar identidades de commit por organizacion (Multi-Trabajo){C_RESET}")
@@ -4590,7 +5382,7 @@ def main():
 
         if canon_cmd:
             dispatch_single_command(canon_cmd, rest, repos_dir, catalog, catalog_file, gh_info, enabled_orgs, disabled_orgs, local_cfg, script_dir, all_known_orgs)
-            if canon_cmd in ["/orgs", "/modo", "/login", "/switch", "/logout", "/catalogo", "/importar-github", "/publico", "/dir", "/set-key", "/ia"]:
+            if canon_cmd in ["/orgs", "/modo", "/login", "/switch", "/logout", "/catalogo", "/importar-github", "/reindex", "/publico", "/dir", "/set-key", "/ia"]:
                 gh_info = get_github_status()
                 all_known_orgs = get_active_orgs(repos_dir, gh_info)
                 disabled_orgs = set(local_cfg.get("disabled_orgs", [])) if local_cfg.get("sync_mode") == "selective" else set()

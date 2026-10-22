@@ -8,6 +8,11 @@ import sys
 import json
 import subprocess
 
+try:
+    from agent import reindex_and_sync_catalog
+except ImportError:
+    reindex_and_sync_catalog = None
+
 C_RESET = "\033[0m"
 C_CYAN = "\033[36m"
 C_GREEN = "\033[32m"
@@ -88,6 +93,27 @@ def main():
 
     # Resolver directorio de repositorios (respeta config.local.json si se personalizo)
     repos_dir = None
+    cli_arg = sys.argv[1] if len(sys.argv) > 1 else ""
+    if cli_arg and cli_arg.lower() in ("reindex", "--reindex", "-r", "--auto"):
+        if local_cfg.get("repos_dir") and os.path.isdir(local_cfg["repos_dir"]):
+            repos_dir = os.path.abspath(local_cfg["repos_dir"])
+        else:
+            parent = os.path.abspath(os.path.join(script_dir, ".."))
+            if os.path.basename(parent) in known_orgs or os.path.basename(parent).lower() in ["personal", "repos-sync"]:
+                repos_dir = os.path.abspath(os.path.join(parent, ".."))
+            else:
+                repos_dir = parent
+        if reindex_and_sync_catalog:
+            reindex_and_sync_catalog(
+                repos_dir=repos_dir,
+                catalog_file=catalog_file,
+                script_dir=script_dir,
+                sync_remote_transfers=("--local" not in sys.argv),
+                auto_move_physical=("--no-move" not in sys.argv),
+                quiet=False
+            )
+            return
+
     if len(sys.argv) > 1 and sys.argv[1]:
         repos_dir = os.path.abspath(sys.argv[1])
     elif local_cfg.get("repos_dir") and os.path.isdir(local_cfg["repos_dir"]):
