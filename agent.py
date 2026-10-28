@@ -1393,36 +1393,78 @@ def inspect_single_repo(entry, repos_dir, with_fetch=False):
     ahead = 0
     behind = 0
     is_local_only = False
+    is_empty_repo = False
+    stub_branch = False
+    stub_remote = ""
+    stub_commits = 0
     dirty_lines = []
 
-    if lines and lines[0].startswith("## "):
-        header = lines[0][3:].strip()
-        dirty_lines = lines[1:]
+    head_rev = run_cmd(["git", "rev-parse", "--verify", "HEAD"], cwd=full_path)
 
-        if "..." in header:
-            parts = header.split("...", 1)
-            branch = parts[0].strip()
-            rest = parts[1].strip()
-            if "[" in rest and "]" in rest:
-                info_b = rest.split("[", 1)[1].split("]", 1)[0]
-                m_ahead = re.search(r'ahead (\d+)', info_b)
-                m_behind = re.search(r'behind (\d+)', info_b)
-                if m_ahead:
-                    ahead = int(m_ahead.group(1))
-                if m_behind:
-                    behind = int(m_behind.group(1))
-        elif "HEAD" in header:
-            branch = "(detached)"
+    if not head_rev:
+        # Repositorio sin commits locales (unborn branch)
+        if lines and lines[0].startswith("## No commits yet on "):
+            branch_part = lines[0][21:].strip()
+            branch = branch_part.split("...")[0].strip()
         else:
-            branch = header.split()[0]
-            is_local_only = True
+            branch = run_cmd(["git", "branch", "--show-current"], cwd=full_path) or entry.get("defaultBranch", "main")
+
+        # Verificar si origin tiene commits para esta rama o la rama por defecto
+        remote_sha = run_cmd(["git", "rev-parse", "--verify", f"origin/{branch}"], cwd=full_path)
+        if not remote_sha:
+            def_b = entry.get("defaultBranch", "main")
+            remote_sha = run_cmd(["git", "rev-parse", "--verify", f"origin/{def_b}"], cwd=full_path)
+
+        if remote_sha:
+            c_cnt = run_cmd(["git", "rev-list", "--count", remote_sha], cwd=full_path)
+            behind = int(c_cnt) if c_cnt.isdigit() else 1
+        else:
+            is_empty_repo = True
     else:
-        dirty_lines = lines
+        if lines and lines[0].startswith("## "):
+            header = lines[0][3:].strip()
+            dirty_lines = lines[1:]
+
+            if "..." in header:
+                parts = header.split("...", 1)
+                branch = parts[0].strip()
+                rest = parts[1].strip()
+                if "[" in rest and "]" in rest:
+                    info_b = rest.split("[", 1)[1].split("]", 1)[0]
+                    m_ahead = re.search(r'ahead (\d+)', info_b)
+                    m_behind = re.search(r'behind (\d+)', info_b)
+                    if m_ahead:
+                        ahead = int(m_ahead.group(1))
+                    if m_behind:
+                        behind = int(m_behind.group(1))
+            elif "HEAD" in header:
+                branch = "(detached)"
+            else:
+                branch = header.split()[0]
+                is_local_only = True
+        else:
+            dirty_lines = lines
+
+        # Detectar si la rama actual es un cascaron inicial (<= 2 commits)
+        # mientras que el desarrollo activo esta en origin/develop u otra rama
+        dirty_count_tmp = len(dirty_lines)
+        if dirty_count_tmp == 0:
+            c_cnt = run_cmd(["git", "rev-list", "--count", "HEAD"], cwd=full_path)
+            if c_cnt in ("1", "2"):
+                dev_rev = run_cmd(["git", "rev-parse", "--verify", "origin/develop"], cwd=full_path)
+                if dev_rev:
+                    dev_cnt = run_cmd(["git", "rev-list", "--count", "origin/develop"], cwd=full_path)
+                    if dev_cnt and dev_cnt.isdigit() and int(dev_cnt) > int(c_cnt):
+                        stub_branch = True
+                        stub_remote = "develop"
+                        stub_commits = int(dev_cnt)
 
     dirty_count = len(dirty_lines)
 
     # Clasificar estado
-    if dirty_count > 0 and ahead > 0:
+    if is_empty_repo:
+        status = "EMPTY_REPO"
+    elif dirty_count > 0 and ahead > 0:
         status = "DIRTY_AND_AHEAD"
     elif dirty_count > 0:
         status = "DIRTY"
@@ -1449,6 +1491,10 @@ def inspect_single_repo(entry, repos_dir, with_fetch=False):
         "ahead": ahead,
         "behind": behind,
         "is_local_only": is_local_only,
+        "is_empty_repo": is_empty_repo,
+        "stub_branch": stub_branch,
+        "stub_remote": stub_remote,
+        "stub_commits": stub_commits,
         "url": entry.get("url", "")
     }
 
@@ -1493,6 +1539,8 @@ def audit_all_repos(repos_dir, catalog, with_fetch=False, max_workers=16, org_fi
     local_only_list  = [r for r in results if r["status"] == "LOCAL_ONLY_BRANCH"]
     diverged_list    = [r for r in results if r["status"] == "DIVERGED"]
     not_cloned_list  = [r for r in results if r["status"] == "NOT_CLONED"]
+    empty_list       = [r for r in results if r["status"] == "EMPTY_REPO"]
+    stub_list        = [r for r in results if r.get("stub_branch")]
 
     total = len(results)
     health_score = max(0.0, min(100.0, ((total - len(dirty_list) - len(ahead_list) - len(behind_list) - len(local_only_list)) / max(1, total)) * 100))
@@ -1509,6 +1557,8 @@ def audit_all_repos(repos_dir, catalog, with_fetch=False, max_workers=16, org_fi
         "local_only": local_only_list,
         "diverged": diverged_list,
         "not_cloned": not_cloned_list,
+        "empty": empty_list,
+        "stub": stub_list,
         "all_results": results
     }
 
@@ -1521,6 +1571,16 @@ def print_health_report(audit, verbose=False):
     print(f"{C_BOLD}|  Indice de Salud del Ecosistema: {color}{score}%{C_RESET} ({audit['duration']}s){C_BOLD}        |{C_RESET}")
     print(f"{C_BOLD}+--------------------------------------------------------+{C_RESET}")
     print(f"  * {C_GREEN}Al dia y limpios:{C_RESET} {len(audit['clean'])} / {audit['total']}")
+
+    if audit.get('empty'):
+        print(f"  * {C_GRAY}Repositorios vacios en GitHub ({len(audit['empty'])}):{C_RESET}")
+        for r in audit['empty']:
+            print(f"      - {C_BOLD}{r['group']}/{r['name']}{C_RESET}: {C_GRAY}Sin commits aun en GitHub (creado vacio){C_RESET}")
+
+    if audit.get('stub'):
+        print(f"  * {C_CYAN}En rama inicial (codigo en develop) ({len(audit['stub'])}):{C_RESET}")
+        for r in audit['stub']:
+            print(f"      - {C_BOLD}{r['group']}/{r['name']}{C_RESET} [{r['branch']}]: {C_CYAN}Codigo activo en 'origin/{r['stub_remote']}' ({r['stub_commits']} commits). Usa /gitflow para activar.{C_RESET}")
 
     if audit['dirty']:
         print(f"  * {C_YELLOW}Con cambios locales ({len(audit['dirty'])}):{C_RESET}")
@@ -1907,6 +1967,7 @@ def interactive_manage_gitflow(repos_dir, catalog, target_repo=None, org_filter=
         scoped_catalog = [c for c in catalog if c.get("group") in org_filter]
 
     gitflow_ok = []
+    gitflow_pending = []
     gitflow_missing = []
 
     for entry in scoped_catalog:
@@ -1920,14 +1981,38 @@ def interactive_manage_gitflow(repos_dir, catalog, target_repo=None, org_filter=
             continue
 
         entry_data = {"entry": entry, "full_path": full_p, "info": gf_info}
-        if gf_info["has_gitflow"]:
+        if gf_info["has_local_develop"]:
             gitflow_ok.append(entry_data)
+        elif gf_info["has_remote_develop"]:
+            gitflow_pending.append(entry_data)
         else:
             gitflow_missing.append(entry_data)
 
     print(f"{C_BOLD}Estado de Gitflow en tus repositorios clonados:{C_RESET}")
-    print(f"  * {C_GREEN}Con Gitflow activo (rama 'develop'):{C_RESET} {len(gitflow_ok)}")
+    print(f"  * {C_GREEN}Con Gitflow activo (rama 'develop' local):{C_RESET} {len(gitflow_ok)}")
+    if gitflow_pending:
+        print(f"  * {C_CYAN}Con 'develop' en GitHub (pendiente de checkout local):{C_RESET} {len(gitflow_pending)}")
     print(f"  * {C_YELLOW}Sin Gitflow (solo rama '{gitflow_missing[0]['info']['base_branch'] if gitflow_missing else 'main'}'):{C_RESET} {len(gitflow_missing)}\n")
+
+    # Si hay repositorios con develop en GitHub pero no en local, permitir activarlos directamente
+    if gitflow_pending:
+        print(f"{C_CYAN}[i] Repositorios con rama 'develop' existente en GitHub no activa en este equipo:{C_RESET}")
+        for idx, p in enumerate(gitflow_pending[:8], 1):
+            print(f"  [{idx:2d}] {p['entry'].get('group')}/{p['entry']['name']} (rama actual: {p['info']['current_branch']})")
+        if len(gitflow_pending) > 8:
+            print(f"  ... y {len(gitflow_pending)-8} mas")
+        try:
+            ans_p = input(f"\n{C_BOLD}¿Deseas activar/hacer checkout de 'develop' en estos {len(gitflow_pending)} repositorios? [S/n]: {C_RESET}").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            ans_p = "n"
+        if ans_p in ["", "s", "si", "y", "yes"]:
+            for p in gitflow_pending:
+                res = implement_gitflow_on_repo(p["full_path"], p["entry"]["name"])
+                if res.get("success"):
+                    print(f"  {C_GREEN}[OK] {p['entry']['name']}: Cambiado a 'develop' desde origin/develop.{C_RESET}")
+                else:
+                    print(f"  {C_RED}[!] {p['entry']['name']}: {res.get('error')}{C_RESET}")
+            print("")
 
     if not gitflow_missing:
         print(f"{C_GREEN}[OK] ¡Excelente! Todos tus repositorios tienen implementada la rama 'develop'.{C_RESET}\n")
@@ -2198,12 +2283,21 @@ def sync_all_repos(repos_dir, catalog, auto_pull=True, auto_clone=True, org_filt
             res = subprocess.run(["git", "clone", item["url"], target])
             if res.returncode == 0:
                 cloned.append(item["name"])
+                # Si origin/develop tiene mas commits que la rama por defecto, activar develop
+                try:
+                    c_main = run_cmd(["git", "rev-list", "--count", "HEAD"], cwd=target)
+                    c_dev = run_cmd(["git", "rev-list", "--count", "origin/develop"], cwd=target)
+                    if c_dev and c_dev.isdigit() and int(c_dev) > int(c_main or '0'):
+                        run_cmd(["git", "checkout", "-b", "develop", "origin/develop"], cwd=target)
+                        print(f"    {C_CYAN}-> Detectado Gitflow activo: Cambiado automaticamente a rama 'develop' ({c_dev} commits).{C_RESET}")
+                except Exception:
+                    pass
 
     pulled = []
     failed_pull = []
 
     def pull_one(r):
-        if r["status"] == "BEHIND" and r["dirty_count"] == 0:
+        if r["status"] == "BEHIND" and r["dirty_count"] == 0 and not r.get("is_empty_repo"):
             res = subprocess.run(["git", "pull", "-q", "--ff-only"], cwd=r["full_path"], stderr=subprocess.DEVNULL)
             if res.returncode == 0:
                 return (r["name"], True)
@@ -2272,6 +2366,13 @@ def clone_specific_repo_or_org(repos_dir, catalog, target_query):
             res = subprocess.run(["git", "clone", item['url'], tp])
             if res.returncode == 0:
                 cloned_count += 1
+                try:
+                    c_main = run_cmd(["git", "rev-list", "--count", "HEAD"], cwd=tp)
+                    c_dev = run_cmd(["git", "rev-list", "--count", "origin/develop"], cwd=tp)
+                    if c_dev and c_dev.isdigit() and int(c_dev) > int(c_main or '0'):
+                        run_cmd(["git", "checkout", "-b", "develop", "origin/develop"], cwd=tp)
+                except Exception:
+                    pass
         print(f"\n{C_GREEN}[OK] Descargados {cloned_count} repositorios de '{matched_org}'.{C_RESET}\n")
         return {"success": True, "cloned": cloned_count}
 
@@ -2329,7 +2430,16 @@ def clone_specific_repo_or_org(repos_dir, catalog, target_query):
     print(f"\n{C_MAGENTA}[CLONE] Descargando {chosen.get('group')}/{chosen['name']} ({chosen['url']})...{C_RESET}")
     res = subprocess.run(["git", "clone", chosen['url'], target_p])
     if res.returncode == 0:
-        print(f"{C_GREEN}[OK] Repositorio clonado exitosamente en: {target_p}{C_RESET}\n")
+        print(f"{C_GREEN}[OK] Repositorio clonado exitosamente en: {target_p}{C_RESET}")
+        try:
+            c_main = run_cmd(["git", "rev-list", "--count", "HEAD"], cwd=target_p)
+            c_dev = run_cmd(["git", "rev-list", "--count", "origin/develop"], cwd=target_p)
+            if c_dev and c_dev.isdigit() and int(c_dev) > int(c_main or '0'):
+                run_cmd(["git", "checkout", "-b", "develop", "origin/develop"], cwd=target_p)
+                print(f"  {C_CYAN}[GITFLOW] Cambiado automaticamente a la rama activa 'develop' ({c_dev} commits).{C_RESET}")
+        except Exception:
+            pass
+        print("")
         return {"success": True, "path": target_p}
     else:
         print(f"{C_RED}[ERROR] No se pudo clonar el repositorio.{C_RESET}\n")

@@ -264,7 +264,16 @@ for item in catalog:
         print(f'\033[35m[CLONE] Clonando en {grp}/{item[\"name\"]}...\033[0m')
         res = subprocess.run(['git', 'clone', item['url'], target])
         if res.returncode == 0:
-            print(f'        \033[32m[OK] {item[\"name\"]} clonado con exito.\033[0m\n')
+            print(f'        \033[32m[OK] {item[\"name\"]} clonado con exito.\033[0m')
+            try:
+                c_main = subprocess.check_output(['git', '-C', target, 'rev-list', '--count', 'HEAD'], stderr=subprocess.DEVNULL).decode('utf-8').strip()
+                c_dev = subprocess.check_output(['git', '-C', target, 'rev-list', '--count', 'origin/develop'], stderr=subprocess.DEVNULL).decode('utf-8').strip()
+                if c_dev and c_dev.isdigit() and int(c_dev) > int(c_main or '0'):
+                    subprocess.run(['git', '-C', target, 'checkout', '-b', 'develop', 'origin/develop'], stderr=subprocess.DEVNULL)
+                    print(f'        \033[36m[GITFLOW] Cambiado a rama activa "develop" ({c_dev} commits).\033[0m')
+            except Exception:
+                pass
+            print('')
         else:
             print(f'        \033[31m[ERROR] No se pudo clonar {item[\"name\"]}.\033[0m\n')
 "
@@ -338,26 +347,56 @@ for item in catalog:
         status_lines = []
     has_dirty = len(status_lines) > 0
 
+    has_head = True
+    try:
+        subprocess.check_output(['git', '-C', r_path, 'rev-parse', '--verify', 'HEAD'], stderr=subprocess.DEVNULL)
+    except Exception:
+        has_head = False
+
+    is_empty_repo = False
     ahead = 0
     behind = 0
     is_local_only = False
-    try:
-        upstream = subprocess.check_output(['git', '-C', r_path, 'rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'], stderr=subprocess.DEVNULL).decode('utf-8').strip()
-        if upstream:
-            ahead_str = subprocess.check_output(['git', '-C', r_path, 'rev-list', '--count', '@{u}..HEAD'], stderr=subprocess.DEVNULL).decode('utf-8').strip()
-            behind_str = subprocess.check_output(['git', '-C', r_path, 'rev-list', '--count', 'HEAD..@{u}'], stderr=subprocess.DEVNULL).decode('utf-8').strip()
-            ahead = int(ahead_str) if ahead_str.isdigit() else 0
-            behind = int(behind_str) if behind_str.isdigit() else 0
-        else:
+
+    if not has_head:
+        # Repositorio sin commits locales (unborn branch)
+        remote_sha = ''
+        try:
+            remote_sha = subprocess.check_output(['git', '-C', r_path, 'rev-parse', '--verify', f'origin/{branch}'], stderr=subprocess.DEVNULL).decode('utf-8').strip()
+        except Exception:
+            pass
+        if not remote_sha:
+            def_b = item.get('defaultBranch', 'main')
             try:
-                remote_check = subprocess.check_output(['git', '-C', r_path, 'rev-parse', '--verify', f'origin/{branch}'], stderr=subprocess.DEVNULL).decode('utf-8').strip()
+                remote_sha = subprocess.check_output(['git', '-C', r_path, 'rev-parse', '--verify', f'origin/{def_b}'], stderr=subprocess.DEVNULL).decode('utf-8').strip()
             except Exception:
-                remote_check = ''
-            if not remote_check and branch != '(detached)':
-                is_local_only = True
-                local_only_count += 1
-    except Exception:
-        upstream = ''
+                pass
+        if remote_sha:
+            try:
+                c_cnt = subprocess.check_output(['git', '-C', r_path, 'rev-list', '--count', remote_sha], stderr=subprocess.DEVNULL).decode('utf-8').strip()
+                behind = int(c_cnt) if c_cnt.isdigit() else 1
+            except Exception:
+                behind = 1
+        else:
+            is_empty_repo = True
+    else:
+        try:
+            upstream = subprocess.check_output(['git', '-C', r_path, 'rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'], stderr=subprocess.DEVNULL).decode('utf-8').strip()
+            if upstream:
+                ahead_str = subprocess.check_output(['git', '-C', r_path, 'rev-list', '--count', '@{u}..HEAD'], stderr=subprocess.DEVNULL).decode('utf-8').strip()
+                behind_str = subprocess.check_output(['git', '-C', r_path, 'rev-list', '--count', 'HEAD..@{u}'], stderr=subprocess.DEVNULL).decode('utf-8').strip()
+                ahead = int(ahead_str) if ahead_str.isdigit() else 0
+                behind = int(behind_str) if behind_str.isdigit() else 0
+            else:
+                try:
+                    remote_check = subprocess.check_output(['git', '-C', r_path, 'rev-parse', '--verify', f'origin/{branch}'], stderr=subprocess.DEVNULL).decode('utf-8').strip()
+                except Exception:
+                    remote_check = ''
+                if not remote_check and branch != '(detached)':
+                    is_local_only = True
+                    local_only_count += 1
+        except Exception:
+            upstream = ''
 
     pull_status = ''
     if behind > 0 and (not has_dirty) and auto_pull:
@@ -368,7 +407,10 @@ for item in catalog:
         else:
             pull_status = ' (pull fallo)'
 
-    if has_dirty and ahead > 0:
+    if is_empty_repo:
+        estado = '[REPO VACIO]'
+        detalle = 'Vacio en GitHub (sin commits)'
+    elif has_dirty and ahead > 0:
         estado = '[CAMBIOS LOCALES + PUSH]'
         detalle = f'{len(status_lines)} modif. y {ahead} commit(s) pendientes'
         dirty_count += 1
@@ -393,9 +435,23 @@ for item in catalog:
         estado = '[ACTUALIZACION DISP]'
         detalle = f'{behind} commit(s) en GitHub por bajar'
     else:
-        estado = '[AL DIA]'
-        detalle = 'Actualizado exitosamente' if pull_status else 'Limpio y sincronizado'
-        up_to_date_count += 1
+        stub_msg = ''
+        if has_head and not has_dirty:
+            try:
+                c_cnt = subprocess.check_output(['git', '-C', r_path, 'rev-list', '--count', 'HEAD'], stderr=subprocess.DEVNULL).decode('utf-8').strip()
+                if c_cnt in ('1', '2'):
+                    dev_cnt = subprocess.check_output(['git', '-C', r_path, 'rev-list', '--count', 'origin/develop'], stderr=subprocess.DEVNULL).decode('utf-8').strip()
+                    if dev_cnt and dev_cnt.isdigit() and int(dev_cnt) > int(c_cnt):
+                        stub_msg = f'Codigo activo en develop ({dev_cnt} commits)'
+            except Exception:
+                pass
+        if stub_msg:
+            estado = '[RAMA INICIAL]'
+            detalle = stub_msg
+        else:
+            estado = '[AL DIA]'
+            detalle = 'Actualizado exitosamente' if pull_status else 'Limpio y sincronizado'
+            up_to_date_count += 1
 
     rows.append((r_group, r_name, branch, estado, detalle))
 
@@ -419,6 +475,10 @@ for grp_name, items in grouped.items():
     for r, b, e, d in items:
         if '[AL DIA]' in e:
             color = '\033[32m'
+        elif '[REPO VACIO]' in e:
+            color = '\033[90m'
+        elif '[RAMA INICIAL]' in e:
+            color = '\033[36m'
         elif '[CAMBIOS LOCALES' in e:
             color = '\033[33m'
         elif '[RAMA SOLO LOCAL]' in e:

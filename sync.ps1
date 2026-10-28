@@ -196,7 +196,16 @@ if ($AutoClone) {
             Write-Host "[CLONE] Clonando repositorio faltante: $($item.group)/$($item.name)..." -ForegroundColor Magenta
             git clone $item.url $targetPath
             if ($LASTEXITCODE -eq 0) {
-                Write-Host "        [OK] $($item.name) clonado con exito.`n" -ForegroundColor Green
+                Write-Host "        [OK] $($item.name) clonado con exito." -ForegroundColor Green
+                try {
+                    $cMain = git -C $targetPath rev-list --count HEAD 2>$null
+                    $cDev = git -C $targetPath rev-list --count origin/develop 2>$null
+                    if ($cDev -and [int]$cDev -gt [int]($cMain -as [int])) {
+                        git -C $targetPath checkout -b develop origin/develop 2>$null
+                        Write-Host "        [GITFLOW] Cambiado a rama activa 'develop' ($cDev commits)." -ForegroundColor Cyan
+                    }
+                } catch {}
+                Write-Host ""
             } else {
                 Write-Host "        [ERROR] No se pudo clonar $($item.name).`n" -ForegroundColor Red
             }
@@ -252,22 +261,43 @@ foreach ($item in $catalog) {
     $statusLines = @(git -C $rPath status --porcelain 2>$null)
     $hasDirty = ($statusLines.Count -gt 0)
 
-    # Verificar tracking upstream
-    $upstream = git -C $rPath rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>$null
+    # Verificar si tiene commits locales (HEAD valido)
+    $hasHead = $true
+    $null = git -C $rPath rev-parse --verify HEAD 2>$null
+    if ($LASTEXITCODE -ne 0) { $hasHead = $false }
 
+    $isEmptyRepo = $false
     $ahead = 0
     $behind = 0
     $isLocalOnly = $false
 
-    if ($upstream) {
-        $aheadCount = git -C $rPath rev-list --count '@{u}..HEAD' 2>$null
-        $behindCount = git -C $rPath rev-list --count 'HEAD..@{u}' 2>$null
-        if ($aheadCount) { $ahead = [int]$aheadCount }
-        if ($behindCount) { $behind = [int]$behindCount }
+    if (-not $hasHead) {
+        # Repositorio sin commits locales (unborn branch)
+        $remoteSha = git -C $rPath rev-parse --verify "origin/$branch" 2>$null
+        if (-not $remoteSha) {
+            $defB = if ($item.defaultBranch) { $item.defaultBranch } else { "main" }
+            $remoteSha = git -C $rPath rev-parse --verify "origin/$defB" 2>$null
+        }
+        if ($remoteSha) {
+            $cCount = git -C $rPath rev-list --count $remoteSha 2>$null
+            if ($cCount) { $behind = [int]$cCount } else { $behind = 1 }
+        } else {
+            $isEmptyRepo = $true
+        }
     } else {
-        $hasRemoteBranch = git -C $rPath rev-parse --verify "origin/$branch" 2>$null
-        if ((-not $hasRemoteBranch) -and ($branch -ne "(detached)")) {
-            $isLocalOnly = $true
+        # Verificar tracking upstream
+        $upstream = git -C $rPath rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>$null
+
+        if ($upstream) {
+            $aheadCount = git -C $rPath rev-list --count '@{u}..HEAD' 2>$null
+            $behindCount = git -C $rPath rev-list --count 'HEAD..@{u}' 2>$null
+            if ($aheadCount) { $ahead = [int]$aheadCount }
+            if ($behindCount) { $behind = [int]$behindCount }
+        } else {
+            $hasRemoteBranch = git -C $rPath rev-parse --verify "origin/$branch" 2>$null
+            if ((-not $hasRemoteBranch) -and ($branch -ne "(detached)")) {
+                $isLocalOnly = $true
+            }
         }
     }
 
@@ -287,7 +317,10 @@ foreach ($item in $catalog) {
     $estadoStr = ""
     $detalleStr = ""
 
-    if ($hasDirty -and ($ahead -gt 0)) {
+    if ($isEmptyRepo) {
+        $estadoStr = "[REPO VACIO]"
+        $detalleStr = "Vacio en GitHub (sin commits aun)"
+    } elseif ($hasDirty -and ($ahead -gt 0)) {
         $estadoStr = "[CAMBIOS LOCALES + PUSH]"
         $detalleStr = "$($statusLines.Count) modif. y $ahead commit(s) pendientes de subir"
     } elseif ($hasDirty) {
@@ -306,11 +339,26 @@ foreach ($item in $catalog) {
         $estadoStr = "[ACTUALIZACION DISP]"
         $detalleStr = "$behind commit(s) en GitHub por bajar"
     } else {
-        $estadoStr = "[AL DIA]"
-        if ($pullStatus) {
-            $detalleStr = "Actualizado exitosamente"
+        $stubMsg = ""
+        if ($hasHead -and (-not $hasDirty)) {
+            $cCount = git -C $rPath rev-list --count HEAD 2>$null
+            if ($cCount -in @("1", "2")) {
+                $devCount = git -C $rPath rev-list --count origin/develop 2>$null
+                if ($devCount -and ([int]$devCount -gt [int]$cCount)) {
+                    $stubMsg = "Codigo activo en develop ($devCount commits)"
+                }
+            }
+        }
+        if ($stubMsg) {
+            $estadoStr = "[RAMA INICIAL]"
+            $detalleStr = $stubMsg
         } else {
-            $detalleStr = "Limpio y sincronizado"
+            $estadoStr = "[AL DIA]"
+            if ($pullStatus) {
+                $detalleStr = "Actualizado exitosamente"
+            } else {
+                $detalleStr = "Limpio y sincronizado"
+            }
         }
     }
 
