@@ -3,8 +3,6 @@
 # setup-mac.sh -- Instalador y Configurador para macOS
 # ==============================================================================
 
-set -e
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PARENT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PARENT_NAME="$(basename "$PARENT_DIR")"
@@ -158,6 +156,34 @@ for legacy in "_sync" "repos-sync"; do
     fi
 done
 
+# Crear ejecutables directos en directorios del PATH para disponibilidad inmediata
+mkdir -p "$HOME/.local/bin" 2>/dev/null || true
+
+for BIN_DIR in "$HOME/.local/bin" "/opt/homebrew/bin" "/usr/local/bin"; do
+    if [ -d "$BIN_DIR" ] && [ -w "$BIN_DIR" ]; then
+        cat << EOF > "$BIN_DIR/gitdoctor"
+#!/usr/bin/env bash
+TARGET=""
+for d in "$SCRIPT_DIR" "\$HOME/Repos/gitdoctor" "\$HOME/repos/gitdoctor" "\$HOME/Documents/Repos/gitdoctor"; do
+    if [ -f "\$d/agent.py" ]; then target="\$d"; break; fi
+done
+if [ -n "\$target" ]; then
+    if [ "\$1" = "--sync" ] || [ "\$1" = "sync" ]; then
+        shift
+        exec "\$target/sync.sh" "\$@"
+    else
+        exec python3 "\$target/agent.py" "\$@"
+    fi
+else
+    echo "[ERROR] No se encontro agent.py en las rutas de GitDoctor."
+    exit 1
+fi
+EOF
+        chmod +x "$BIN_DIR/gitdoctor" 2>/dev/null || true
+        ln -sf "$BIN_DIR/gitdoctor" "$BIN_DIR/gitdoc" 2>/dev/null || true
+    fi
+done
+
 SHELL_BLOCK="# >>> GitDoctor Global Commands >>>
 if [ -d \"\$HOME/.local/bin\" ] && [[ \":\$PATH:\" != *\":\$HOME/.local/bin:\"* ]]; then
     export PATH=\"\$HOME/.local/bin:\$PATH\"
@@ -165,7 +191,7 @@ fi
 
 gitdoctor() {
     local target=\"\"
-    for d in \"$SCRIPT_DIR\" \"\$HOME/Repos/gitdoctor\" \"\$HOME/repos/gitdoctor\"; do
+    for d in \"$SCRIPT_DIR\" \"\$HOME/Repos/gitdoctor\" \"\$HOME/repos/gitdoctor\" \"\$HOME/Documents/Repos/gitdoctor\"; do
         if [ -f \"\$d/agent.py\" ]; then target=\"\$d\"; break; fi
     done
     if [ -n \"\$target\" ]; then
@@ -192,14 +218,28 @@ reposync-ai() {
 }
 # <<< GitDoctor Global Commands <<<"
 
-for TARGET_RC in "$HOME/.zshrc" "$HOME/.bash_profile"; do
-    if [ -f "$TARGET_RC" ]; then
-        python3 -c "
+# Asegurar que ~/.zshrc exista en equipos Mac limpios
+if [ ! -f "$HOME/.zshrc" ]; then
+    touch "$HOME/.zshrc"
+fi
+
+TARGET_RCS=("$HOME/.zshrc")
+if [ -f "$HOME/.zprofile" ]; then
+    TARGET_RCS+=("$HOME/.zprofile")
+fi
+if [ -f "$HOME/.bash_profile" ]; then
+    TARGET_RCS+=("$HOME/.bash_profile")
+fi
+
+for TARGET_RC in "${TARGET_RCS[@]}"; do
+    python3 -c "
 import re
 path = '$TARGET_RC'
-with open(path, 'r', encoding='utf-8', errors='replace') as f:
-    c = f.read()
-# Reemplazar bloques viejos de RepoSync o GitDoctor
+try:
+    with open(path, 'r', encoding='utf-8', errors='replace') as f:
+        c = f.read()
+except FileNotFoundError:
+    c = ''
 pattern_old = r'# >>> (?:RepoSync|GitDoctor) Global (?:Alias|Commands) >>>[\s\S]*?# <<< (?:RepoSync|GitDoctor) Global (?:Alias|Commands) <<<'
 new_block = '''$SHELL_BLOCK'''
 if re.search(pattern_old, c):
@@ -212,7 +252,6 @@ else:
 with open(path, 'w', encoding='utf-8') as f:
     f.write(c)
 "
-    fi
 done
 if [ "$REAJUSTE_MODE" = false ]; then
     echo -e "      ${C_GREEN}[OK] Comandos globales 'gitdoctor' y 'gitdoc' configurados en tu terminal.${C_RESET}"
@@ -276,22 +315,28 @@ fi
 
 # 5. Auditoria de seguridad y reconciliacion
 echo -e "\n${C_YELLOW}[*] Ejecutando reconciliacion de carpetas...${C_RESET}"
-python3 "$SCRIPT_DIR/reconcile.py" "$REPOS_DIR"
+python3 "$SCRIPT_DIR/reconcile.py" "$REPOS_DIR" || echo -e "      ${C_YELLOW}[AVISO] Reconciliacion inicial finalizada con observaciones. Puedes revisarla con: gitdoctor /salud${C_RESET}"
 
 # 6. Sincronizacion inicial si fue solicitada en la instalacion
 if [ "$DOWNLOAD_ON_SETUP" = true ]; then
     echo -e "\n${C_YELLOW}[*] Procediendo con la sincronizacion y descarga de repositorios faltantes...${C_RESET}"
-    "$SCRIPT_DIR/sync.sh"
+    "$SCRIPT_DIR/sync.sh" || echo -e "      ${C_YELLOW}[AVISO] La sincronizacion inicial finalizo con advertencias.${C_RESET}"
 else
     echo -e "\n${C_CYAN}[INFO] Modo bajo demanda activo. Tus proyectos estan catalogados en repos.local.json.${C_RESET}"
     echo -e "${C_GRAY}Para clonar cualquier repositorio cuando lo requieras usa: gitdoctor /clone <nombre>${C_RESET}"
     echo -e "${C_GRAY}O para sincronizar todo en cualquier momento usa:        gitdoctor --sync${C_RESET}"
 fi
 
+# 7. Auto-diagnostico y certificacion final
+echo -e "\n${C_YELLOW}[*] Certificando entorno del sistema con /doctor...${C_RESET}"
+python3 "$SCRIPT_DIR/agent.py" /doctor --quiet 2>/dev/null || true
+
 echo ""
 echo -e "${C_GREEN}==========================================================${C_RESET}"
 echo -e "${C_GREEN}  ¡Instalacion de GitDoctor completada con exito en tu Mac!${C_RESET}"
 echo -e "${C_WHITE}  A partir de ahora usa 'gitdoctor' (o 'gitdoc') en tu${C_RESET}"
 echo -e "${C_WHITE}  terminal para tener todo diagnosticado y al dia.${C_RESET}"
+echo -e "${C_CYAN}  Tip: Para usar 'gitdoctor' en ESTA misma ventana ejecuta:${C_RESET}"
+echo -e "${C_BOLD}       source ~/.zshrc${C_RESET} ${C_GRAY}(o abre una nueva pestaña de terminal)${C_RESET}"
 echo -e "${C_GREEN}==========================================================${C_RESET}"
 echo ""

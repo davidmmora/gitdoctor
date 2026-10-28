@@ -249,6 +249,7 @@ with open(catalog_file, 'r', encoding='utf-8-sig') as f:
 if disabled_orgs:
     catalog = [c for c in catalog if c.get('group') not in disabled_orgs]
 
+pruned_paths = []
 for item in catalog:
     if item.get('name') in ['gitdoctor', 'repos-sync'] or item.get('url', '').endswith('/gitdoctor.git') or item.get('url', '').endswith('/repos-sync.git'):
         continue
@@ -262,7 +263,7 @@ for item in catalog:
     if not os.path.exists(target):
         grp = item.get('group', '')
         print(f'\033[35m[CLONE] Clonando en {grp}/{item[\"name\"]}...\033[0m')
-        res = subprocess.run(['git', 'clone', item['url'], target])
+        res = subprocess.run(['git', 'clone', item['url'], target], capture_output=True, text=True)
         if res.returncode == 0:
             print(f'        \033[32m[OK] {item[\"name\"]} clonado con exito.\033[0m')
             try:
@@ -275,7 +276,24 @@ for item in catalog:
                 pass
             print('')
         else:
-            print(f'        \033[31m[ERROR] No se pudo clonar {item[\"name\"]}.\033[0m\n')
+            err = (res.stderr or '') + ' ' + (res.stdout or '')
+            is_deleted = False
+            if 'not found' in err.lower() or 'repository not found' in err.lower():
+                gh_c = subprocess.run(['gh', 'repo', 'view', f'{grp}/{item[\"name\"]}'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if gh_c.returncode != 0:
+                    is_deleted = True
+            if is_deleted:
+                print(f'        \033[33m[AUTO-PRUNE] {grp}/{item[\"name\"]} fue eliminado de GitHub. Retirandolo del catalogo...\033[0m\n')
+                pruned_paths.append(rel_path.lower())
+            else:
+                print(f'        \033[31m[ERROR] No se pudo clonar {item[\"name\"]}: {err.strip()}\033[0m\n')
+
+if pruned_paths:
+    with open(catalog_file, 'r', encoding='utf-8-sig') as f:
+        full_cat = json.load(f)
+    full_cat = [c for c in full_cat if c.get('path', os.path.join(c.get('group', ''), c['name'])).replace('\\\\', '/').lower() not in pruned_paths]
+    with open(catalog_file, 'w', encoding='utf-8') as f:
+        json.dump(full_cat, f, indent=4, ensure_ascii=False)
 "
 fi
 

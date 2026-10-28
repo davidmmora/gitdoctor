@@ -180,6 +180,7 @@ if ($disabledOrgs.Count -gt 0) {
 
 # 2. Verificar y clonar repositorios faltantes
 if ($AutoClone) {
+    $prunedCatalogPaths = @()
     foreach ($item in $catalog) {
         if ($item.name -in @("gitdoctor", "repos-sync") -or ($item.url -and ($item.url.ToLower().EndsWith("/gitdoctor.git") -or $item.url.ToLower().EndsWith("/repos-sync.git")))) {
             continue
@@ -194,7 +195,7 @@ if ($AutoClone) {
 
         if (-not (Test-Path $targetPath)) {
             Write-Host "[CLONE] Clonando repositorio faltante: $($item.group)/$($item.name)..." -ForegroundColor Magenta
-            git clone $item.url $targetPath
+            $cloneOut = git clone $item.url $targetPath 2>&1 | Out-String
             if ($LASTEXITCODE -eq 0) {
                 Write-Host "        [OK] $($item.name) clonado con exito." -ForegroundColor Green
                 try {
@@ -207,9 +208,30 @@ if ($AutoClone) {
                 } catch {}
                 Write-Host ""
             } else {
-                Write-Host "        [ERROR] No se pudo clonar $($item.name).`n" -ForegroundColor Red
+                $isDeleted = $false
+                if ($cloneOut -match "not found" -or $cloneOut -match "Repository not found") {
+                    $null = gh repo view "$($item.group)/$($item.name)" 2>&1
+                    if ($LASTEXITCODE -ne 0) {
+                        $isDeleted = $true
+                    }
+                }
+                if ($isDeleted) {
+                    Write-Host "        [AUTO-PRUNE] $($item.group)/$($item.name) ya no existe en GitHub. Retirandolo del catalogo...`n" -ForegroundColor Yellow
+                    $prunedCatalogPaths += $relPath.ToLower()
+                } else {
+                    Write-Host "        [ERROR] No se pudo clonar $($item.name).`n" -ForegroundColor Red
+                }
             }
         }
+    }
+
+    if ($prunedCatalogPaths -and $prunedCatalogPaths.Count -gt 0) {
+        $rawCat = Get-Content $catalogFile -Raw -Encoding UTF8 | ConvertFrom-Json
+        $newCat = $rawCat | Where-Object {
+            $p = if ($_.path) { $_.path -replace '/', '\' } else { "$($_.group)\$($_.name)" }
+            $p.ToLower() -notin $prunedCatalogPaths
+        }
+        $newCat | ConvertTo-Json -Depth 10 | Set-Content $catalogFile -Encoding UTF8
     }
 }
 

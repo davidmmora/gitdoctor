@@ -277,6 +277,10 @@ if ($downloadOnSetup) {
     Write-Host "O para sincronizar todo en cualquier momento usa:        gitdoctor --sync" -ForegroundColor DarkGray
 }
 
+# 5. Certificacion final con /doctor
+Write-Host "`n[*] Certificando entorno del sistema con /doctor..." -ForegroundColor Yellow
+python (Join-Path $scriptDir "agent.py") /doctor --quiet 2>$null
+
 Write-Host ""
 Write-Host "==========================================================" -ForegroundColor Green
 Write-Host "  ¡Instalacion de GitDoctor completada con exito!" -ForegroundColor Green

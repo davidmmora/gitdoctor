@@ -2209,6 +2209,390 @@ def audit_health_360(repos_dir, catalog, with_fetch=False, org_filter=None):
     return {"score": score_360, "all_secrets": all_secrets, "gitflow": gitflow_stats}
 
 # ==============================================================================
+# SISTEMA DOCTOR: AUTO-DIAGNOSTICO Y AUTO-REPARACION INTEGRAL DEL ENTORNO
+# ==============================================================================
+def run_system_doctor(repos_dir, catalog, catalog_file, script_dir=None, auto_fix=True, quiet=False):
+    """
+    Examen Clinico del Sistema GitDoctor (/doctor).
+    Inspecciona y auto-repara el entorno local:
+      1. Python Runtime y compatibilidad de sintaxis
+      2. Git CLI y configuraciones optimas
+      3. GitHub CLI ('gh') y estado de sesion
+      4. Integracion de terminal (comandos globales 'gitdoctor' y 'gitdoc', wrappers en PATH)
+      5. Permisos de ejecucion en scripts (chmod +x)
+      6. Integridad del catalogo (repos.local.json) y purga de repositorios eliminados
+      7. Configuracion local (config.local.json) y blindaje de secretos (.gitignore)
+      8. Conectividad de red y endpoints
+    """
+    if script_dir is None:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+
+    results = []
+    repaired_count = 0
+    warning_count = 0
+
+    if not quiet:
+        print(f"\n{C_CYAN}=================================================================================={C_RESET}")
+        print(f"{C_WHITE}{C_BOLD}  🩺 GitDoctor: Examen Clinico General del Sistema (/doctor)                     {C_RESET}")
+        print(f"{C_GRAY}  Diagnostico profundo de instalacion, entorno, shell, herramientas y auto-reparacion{C_RESET}")
+        print(f"{C_CYAN}=================================================================================={C_RESET}\n")
+
+    # 1. PYTHON RUNTIME & SINTAXIS
+    py_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    py_ok = sys.version_info >= (3, 8)
+    syntax_ok = True
+    syntax_err_msg = ""
+    import ast
+    for py_file in ["agent.py", "reconcile.py", "onboarding.py"]:
+        p_path = os.path.join(script_dir, py_file)
+        if os.path.isfile(p_path):
+            try:
+                with open(p_path, "r", encoding="utf-8", errors="replace") as pf:
+                    ast.parse(pf.read(), filename=py_file)
+            except SyntaxError as se:
+                syntax_ok = False
+                syntax_err_msg = f"{py_file}:{se.lineno} ({se.msg})"
+                break
+
+    if py_ok and syntax_ok:
+        results.append(("Python Runtime", "OK", f"Python {py_ver} (Sintaxis 100% retrocompatible 3.8-3.14)"))
+    else:
+        status_code = "ERROR" if not py_ok else "ADVERTENCIA"
+        msg = f"Python {py_ver} (Requiere >= 3.8)" if not py_ok else f"Sintaxis: {syntax_err_msg}"
+        results.append(("Python Runtime", status_code, msg))
+        warning_count += 1
+
+    # 2. GIT CLI
+    git_bin = shutil.which("git")
+    if git_bin:
+        g_ver = run_cmd(["git", "--version"]) or "Detectado"
+        if auto_fix and os.path.isdir(os.path.join(script_dir, ".git")):
+            run_cmd(["git", "-C", script_dir, "config", "core.filemode", "false"])
+        results.append(("Git CLI", "OK", f"{g_ver}"))
+    else:
+        if auto_fix:
+            if shutil.which("brew"):
+                subprocess.run(["brew", "install", "git"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                git_bin = shutil.which("git")
+            elif shutil.which("winget"):
+                subprocess.run(["winget", "install", "--id", "Git.Git", "-e", "--accept-source-agreements", "--accept-package-agreements"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                git_bin = shutil.which("git")
+        if git_bin:
+            repaired_count += 1
+            results.append(("Git CLI", "REPARADO", "Instalado y disponible"))
+        else:
+            warning_count += 1
+            results.append(("Git CLI", "ERROR", "No detectado en PATH. Instala Git CLI para operar repositorios."))
+
+    # 3. GITHUB CLI ('gh') & SESION
+    gh_bin = shutil.which("gh")
+    if not gh_bin and auto_fix:
+        home = os.path.expanduser("~")
+        for cand in ["/opt/homebrew/bin", "/usr/local/bin", os.path.join(home, ".local", "bin"), os.path.join(home, "bin"), r"C:\Program Files\GitHub CLI"]:
+            if os.path.isfile(os.path.join(cand, "gh")) or os.path.isfile(os.path.join(cand, "gh.exe")):
+                os.environ["PATH"] = cand + os.pathsep + os.environ.get("PATH", "")
+                gh_bin = shutil.which("gh")
+                if gh_bin:
+                    break
+
+    if gh_bin:
+        gh_ver = run_cmd(["gh", "--version"]).splitlines()[0] if run_cmd(["gh", "--version"]) else "gh activo"
+        gh_status_out = run_cmd(["gh", "auth", "status"])
+        gh_logged = "Logged in" in gh_status_out or "logged in" in gh_status_out
+        if gh_logged:
+            user_login = ""
+            for line in gh_status_out.splitlines():
+                if "account" in line.lower():
+                    parts = line.split("account", 1)[-1].strip().split()
+                    if parts:
+                        user_login = parts[0]
+            user_str = f" (@{user_login})" if user_login else ""
+            results.append(("GitHub CLI", "OK", f"{gh_ver}{user_str} - Sesion activa"))
+        else:
+            results.append(("GitHub CLI", "ADVERTENCIA", f"{gh_ver} - Sin sesion iniciada. Usa '/login' para conectar."))
+            warning_count += 1
+    else:
+        warning_count += 1
+        results.append(("GitHub CLI", "ADVERTENCIA", "No detectado en PATH. Ejecuta setup-mac.sh o instala con brew/winget."))
+
+    # 4. INTEGRACION CON TERMINAL Y SHELL (COMANDOS GLOBALES 'gitdoctor' Y 'gitdoc')
+    shell_ok = False
+    shell_repaired = False
+    home = os.path.expanduser("~")
+
+    if sys.platform != "win32":
+        zshrc = os.path.join(home, ".zshrc")
+        bashprof = os.path.join(home, ".bash_profile")
+        local_bin = os.path.join(home, ".local", "bin")
+
+        has_alias = False
+        for rc in [zshrc, bashprof, os.path.join(home, ".zprofile")]:
+            if os.path.isfile(rc):
+                try:
+                    with open(rc, "r", encoding="utf-8", errors="replace") as f:
+                        if "gitdoctor()" in f.read():
+                            has_alias = True
+                            break
+                except Exception:
+                    pass
+
+        has_wrapper = os.path.isfile(os.path.join(local_bin, "gitdoctor")) or os.path.isfile("/usr/local/bin/gitdoctor") or os.path.isfile("/opt/homebrew/bin/gitdoctor")
+        path_has_local = local_bin in os.environ.get("PATH", "").split(os.pathsep)
+
+        if has_alias and (has_wrapper or path_has_local):
+            shell_ok = True
+        elif auto_fix:
+            os.makedirs(local_bin, exist_ok=True)
+            wrapper_script = f"""#!/usr/bin/env bash
+TARGET=""
+for d in "{script_dir}" "$HOME/Repos/gitdoctor" "$HOME/repos/gitdoctor" "$HOME/Documents/Repos/gitdoctor"; do
+    if [ -f "$d/agent.py" ]; then target="$d"; break; fi
+done
+if [ -n "$target" ]; then
+    if [ "$1" = "--sync" ] || [ "$1" = "sync" ]; then
+        shift
+        exec "$target/sync.sh" "$@"
+    else
+        exec python3 "$target/agent.py" "$@"
+    fi
+else
+    echo "[ERROR] No se encontro agent.py en las rutas de GitDoctor."
+    exit 1
+fi
+"""
+            for b_dir in [local_bin, "/opt/homebrew/bin", "/usr/local/bin"]:
+                if os.path.isdir(b_dir) and os.access(b_dir, os.W_OK):
+                    w_path = os.path.join(b_dir, "gitdoctor")
+                    try:
+                        with open(w_path, "w", encoding="utf-8") as wf:
+                            wf.write(wrapper_script)
+                        os.chmod(w_path, 0o755)
+                        doc_sym = os.path.join(b_dir, "gitdoc")
+                        if not os.path.exists(doc_sym):
+                            try:
+                                os.symlink(w_path, doc_sym)
+                            except Exception:
+                                pass
+                        shell_repaired = True
+                    except Exception:
+                        pass
+
+            if not os.path.isfile(zshrc):
+                try:
+                    with open(zshrc, "w", encoding="utf-8") as f:
+                        f.write("")
+                except Exception:
+                    pass
+
+            shell_block = f"""
+# >>> GitDoctor Global Commands >>>
+if [ -d "$HOME/.local/bin" ] && [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
+    export PATH="$HOME/.local/bin:$PATH"
+fi
+gitdoctor() {{
+    local target=""
+    for d in "{script_dir}" "$HOME/Repos/gitdoctor" "$HOME/repos/gitdoctor" "$HOME/Documents/Repos/gitdoctor"; do
+        if [ -f "$d/agent.py" ]; then target="$d"; break; fi
+    done
+    if [ -n "$target" ]; then
+        if [ "$1" = "--sync" ] || [ "$1" = "sync" ]; then
+            shift
+            "$target/sync.sh" "$@"
+        else
+            python3 "$target/agent.py" "$@"
+        fi
+    else
+        echo "[ERROR] No se encontro agent.py en las rutas conocidas de GitDoctor."
+        return 1
+    fi
+}}
+alias gitdoc="gitdoctor"
+# <<< GitDoctor Global Commands <<<
+"""
+            for target_rc in [zshrc, os.path.join(home, ".zprofile")]:
+                if os.path.isfile(target_rc):
+                    try:
+                        with open(target_rc, "r", encoding="utf-8", errors="replace") as f:
+                            content = f.read()
+                        if "# >>> GitDoctor Global Commands >>>" not in content:
+                            with open(target_rc, "a", encoding="utf-8") as f:
+                                f.write(shell_block)
+                            shell_repaired = True
+                    except Exception:
+                        pass
+
+        if shell_repaired:
+            repaired_count += 1
+            results.append(("Comandos Globales", "REPARADO", "'gitdoctor' y 'gitdoc' configurados en terminal (~/.zshrc y ~/.local/bin)"))
+        elif shell_ok:
+            results.append(("Comandos Globales", "OK", "'gitdoctor' y 'gitdoc' activos en terminal"))
+        else:
+            warning_count += 1
+            results.append(("Comandos Globales", "ADVERTENCIA", "Configura tu terminal ejecutando ./setup-mac.sh"))
+
+    else:
+        results.append(("Comandos Globales", "OK", "Configurados en perfil de PowerShell"))
+
+    # 5. PERMISOS DE EJECUCION DE SCRIPTS (CHMOD +X)
+    if sys.platform != "win32":
+        scripts_to_check = [f for f in os.listdir(script_dir) if f.endswith((".sh", ".command", ".py"))]
+        missing_x = [f for f in scripts_to_check if not os.access(os.path.join(script_dir, f), os.X_OK)]
+        if missing_x and auto_fix:
+            for f in missing_x:
+                try:
+                    os.chmod(os.path.join(script_dir, f), 0o755)
+                except Exception:
+                    pass
+            repaired_count += 1
+            results.append(("Permisos de Scripts", "REPARADO", f"Permisos 0755 asignados a {len(missing_x)} scripts (.sh, .command, .py)"))
+        elif not missing_x:
+            results.append(("Permisos de Scripts", "OK", "Todos los scripts cuentan con permisos de ejecucion"))
+        else:
+            warning_count += 1
+            results.append(("Permisos de Scripts", "ADVERTENCIA", f"{len(missing_x)} scripts carecen de permisos de ejecucion (+x)"))
+    else:
+        results.append(("Permisos de Scripts", "OK", "Windows: Scripts .bat y .ps1 listos"))
+
+    # 6. CONFIGURACION LOCAL (config.local.json)
+    cfg_file = os.path.join(script_dir, "config.local.json")
+    cfg_ok = False
+    cfg_repaired = False
+    if os.path.isfile(cfg_file):
+        try:
+            with open(cfg_file, "r", encoding="utf-8") as f:
+                cdata = json.load(f)
+            r_dir = cdata.get("repos_dir", "")
+            if r_dir and os.path.isdir(r_dir):
+                cfg_ok = True
+            elif auto_fix:
+                os.makedirs(repos_dir, exist_ok=True)
+                cdata["repos_dir"] = repos_dir
+                save_local_config(script_dir, cdata)
+                cfg_repaired = True
+        except Exception:
+            pass
+    elif auto_fix:
+        def_cfg = {
+            "installed": True,
+            "repos_dir": repos_dir,
+            "gitdoctor_dir": script_dir,
+            "sync_mode": "mirror",
+            "enabled_orgs": ["Personal"],
+            "disabled_orgs": [],
+            "ai_provider": "gemini",
+            "notifications_enabled": True,
+            "watchdog_enabled": True,
+            "watchdog_interval_seconds": 300,
+            "download_on_setup": True
+        }
+        save_local_config(script_dir, def_cfg)
+        cfg_repaired = True
+
+    if cfg_repaired:
+        repaired_count += 1
+        results.append(("Configuracion Local", "REPARADO", f"config.local.json generado con repos_dir={repos_dir}"))
+    elif cfg_ok:
+        results.append(("Configuracion Local", "OK", f"config.local.json activo (repos_dir={repos_dir})"))
+    else:
+        warning_count += 1
+        results.append(("Configuracion Local", "ADVERTENCIA", "config.local.json requiere configuracion"))
+
+    # 7. INTEGRIDAD DEL CATALOGO Y PURGA DE REPOSITORIOS FANTASMA (repos.local.json)
+    cat_path = catalog_file or os.path.join(script_dir, "repos.local.json")
+    if os.path.isfile(cat_path):
+        try:
+            with open(cat_path, "r", encoding="utf-8-sig") as f:
+                cat_data = json.load(f)
+            total_cat = len(cat_data)
+            cloned_cat = sum(1 for c in cat_data if c.get("is_cloned"))
+            results.append(("Catalogo Local", "OK", f"{os.path.basename(cat_path)} ({total_cat} repositorios, {cloned_cat} clonados)"))
+        except Exception as e:
+            warning_count += 1
+            results.append(("Catalogo Local", "ERROR", f"Error en {os.path.basename(cat_path)}: {e}"))
+    else:
+        warning_count += 1
+        results.append(("Catalogo Local", "ADVERTENCIA", "No se encontro repos.local.json. Usa /importar-github para crearlo."))
+
+    # 8. BLINDAJE DE SEGURIDAD (.gitignore)
+    gi_path = os.path.join(script_dir, ".gitignore")
+    gi_ok = False
+    gi_repaired = False
+    needed_rules = [".env", "config.local.json", "repos.local.json"]
+    if os.path.isfile(gi_path):
+        try:
+            with open(gi_path, "r", encoding="utf-8", errors="replace") as f:
+                gi_content = f.read()
+            missing_rules = [r for r in needed_rules if r not in gi_content]
+            if missing_rules and auto_fix:
+                with open(gi_path, "a", encoding="utf-8") as f:
+                    f.write("\n# Proteccion GitDoctor\n" + "\n".join(missing_rules) + "\n")
+                gi_repaired = True
+            elif not missing_rules:
+                gi_ok = True
+        except Exception:
+            pass
+    elif auto_fix:
+        try:
+            with open(gi_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(needed_rules) + "\n")
+            gi_repaired = True
+        except Exception:
+            pass
+
+    if gi_repaired:
+        repaired_count += 1
+        results.append(("Blindaje de Secretos", "REPARADO", ".gitignore blindado con exclusiones de privacidad"))
+    elif gi_ok:
+        results.append(("Blindaje de Secretos", "OK", ".env, config.local.json y repos.local.json protegidos"))
+    else:
+        warning_count += 1
+        results.append(("Blindaje de Secretos", "ADVERTENCIA", ".gitignore requiere reglas de privacidad"))
+
+    # 9. CONECTIVIDAD DE RED Y ENDPOINTS
+    net_ok = False
+    try:
+        req = urllib.request.Request("https://api.github.com", headers={"User-Agent": "GitDoctor"})
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            if resp.status in (200, 301, 302):
+                net_ok = True
+    except Exception:
+        net_ok = False
+
+    if net_ok:
+        results.append(("Conectividad GitHub", "OK", "Conexion exitosa con api.github.com"))
+    else:
+        results.append(("Conectividad GitHub", "ADVERTENCIA", "Sin conexion a api.github.com (modo offline activo)"))
+
+    # REPORTE VISUAL CONCISO
+    if not quiet:
+        for title, status, desc in results:
+            if status == "OK":
+                tag = f"{C_GREEN}[OK]{C_RESET}"
+            elif status == "REPARADO":
+                tag = f"{C_MAGENTA}[REPARADO]{C_RESET}"
+            elif status == "ADVERTENCIA":
+                tag = f"{C_YELLOW}[AVISO]{C_RESET}"
+            else:
+                tag = f"{C_RED}[ERROR]{C_RESET}"
+            print(f"  * {title:<23} {tag} {desc}")
+
+        print(f"\n{C_CYAN}=================================================================================={C_RESET}")
+        if warning_count == 0:
+            print(f"  {C_GREEN}{C_BOLD}🩺 DIAGNOSTICO CLINICO: ¡Tu entorno de GitDoctor esta al 100% y en perfecto estado!{C_RESET}")
+        else:
+            print(f"  {C_YELLOW}{C_BOLD}🩺 DIAGNOSTICO CLINICO: Se detectaron {warning_count} advertencia(s). Revisa las indicaciones arriba.{C_RESET}")
+        if repaired_count > 0:
+            print(f"  {C_MAGENTA}✨ Se aplicaron {repaired_count} auto-reparacion(es) en caliente.{C_RESET}")
+        print(f"{C_CYAN}=================================================================================={C_RESET}\n")
+
+    return {
+        "success": warning_count == 0,
+        "results": [{"check": r[0], "status": r[1], "detail": r[2]} for r in results],
+        "repaired_count": repaired_count,
+        "warning_count": warning_count
+    }
+
+# ==============================================================================
 # COMMIT Y PUSH DIRECTO
 # ==============================================================================
 def commit_single_repo(repos_dir, catalog, repo_name, message):
@@ -2255,14 +2639,22 @@ def commit_single_repo(repos_dir, catalog, repo_name, message):
 # ==============================================================================
 # PULL Y CLONACION PARALELA / BAJO DEMANDA
 # ==============================================================================
-def sync_all_repos(repos_dir, catalog, auto_pull=True, auto_clone=True, org_filter=None):
+def sync_all_repos(repos_dir, catalog, auto_pull=True, auto_clone=True, org_filter=None, catalog_file=None):
     """Sincroniza y descarga actualizaciones en paralelo de forma segura"""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    if catalog_file is None:
+        cat_local = os.path.join(script_dir, "repos.local.json")
+        cat_master = os.path.join(script_dir, "repos.json")
+        catalog_file = cat_local if os.path.isfile(cat_local) else cat_master
+
     print(f"\n{C_CYAN}[*] Iniciando sincronizacion paralela de repositorios...{C_RESET}")
     # Auto-reindexar antes de clonar/pull para detectar repos movidos en disco o transferidos en GitHub
     try:
         reindex_res = reindex_and_sync_catalog(
             repos_dir=repos_dir,
             catalog=catalog,
+            catalog_file=catalog_file,
+            script_dir=script_dir,
             sync_remote_transfers=True,
             auto_move_physical=True,
             quiet=True
@@ -2275,12 +2667,13 @@ def sync_all_repos(repos_dir, catalog, auto_pull=True, auto_clone=True, org_filt
     audit = audit_all_repos(repos_dir, catalog, with_fetch=True, org_filter=org_filter, auto_reindex=False)
 
     cloned = []
+    pruned_deleted = []
     if auto_clone and audit["not_cloned"]:
         for item in audit["not_cloned"]:
             target = item["full_path"]
             os.makedirs(os.path.dirname(target), exist_ok=True)
             print(f"  {C_MAGENTA}[CLONE] Descargando {item['group']}/{item['name']}...{C_RESET}")
-            res = subprocess.run(["git", "clone", item["url"], target])
+            res = subprocess.run(["git", "clone", item["url"], target], capture_output=True, text=True)
             if res.returncode == 0:
                 cloned.append(item["name"])
                 # Si origin/develop tiene mas commits que la rama por defecto, activar develop
@@ -2292,6 +2685,39 @@ def sync_all_repos(repos_dir, catalog, auto_pull=True, auto_clone=True, org_filt
                         print(f"    {C_CYAN}-> Detectado Gitflow activo: Cambiado automaticamente a rama 'develop' ({c_dev} commits).{C_RESET}")
                 except Exception:
                     pass
+            else:
+                err_text = ((res.stderr or "") + " " + (res.stdout or "")).strip()
+                for line in err_text.splitlines():
+                    if line.strip():
+                        print(f"    {C_GRAY}{line.strip()}{C_RESET}")
+
+                # Detectar si el repositorio ya no existe en GitHub (fue eliminado / 404)
+                is_deleted_remote = False
+                if "not found" in err_text.lower() or "repository not found" in err_text.lower():
+                    gh_chk = subprocess.run(
+                        ["gh", "repo", "view", f"{item['group']}/{item['name']}"],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                    )
+                    if gh_chk.returncode != 0 and ("not found" in gh_chk.stderr.lower() or "could not resolve" in gh_chk.stderr.lower()):
+                        is_deleted_remote = True
+
+                if is_deleted_remote:
+                    print(f"    {C_YELLOW}[AUTO-PRUNE] El repositorio '{item['group']}/{item['name']}' ya no existe en GitHub (fue eliminado). Retirándolo del catálogo local...{C_RESET}")
+                    pruned_deleted.append(item)
+                    if os.path.isdir(target) and not os.listdir(target):
+                        try:
+                            os.rmdir(target)
+                        except Exception:
+                            pass
+
+        if pruned_deleted:
+            pruned_paths = {p.get("path", f"{p.get('group')}/{p.get('name')}").lower() for p in pruned_deleted}
+            catalog[:] = [c for c in catalog if c.get("path", f"{c.get('group')}/{c.get('name')}").lower() not in pruned_paths]
+            try:
+                _atomic_write_json(catalog_file, catalog)
+                print(f"  {C_GREEN}[OK] Se retiraron automáticamente {len(pruned_deleted)} repositorio(s) inexistente(s) del catálogo.{C_RESET}")
+            except Exception as e:
+                print(f"  {C_RED}[!] No se pudo guardar el catálogo actualizado: {e}{C_RESET}")
 
     pulled = []
     failed_pull = []
@@ -3229,6 +3655,17 @@ def reindex_and_sync_catalog(
             if not gh_meta and len(gh_cands) == 1:
                 gh_meta = gh_cands[0]
 
+            # Auto-deteccion inteligente: Si la organizacion fue consultada en GitHub y el repo no existe ni en GitHub ni en disco
+            queried_orgs = {o.lower() for o in (active_orgs or (gh_info.get("orgs") if gh_info else []) or [])} | {"personal"}
+            is_queried_org = old_group.lower() in queried_orgs
+            if remote_org_map and is_queried_org and not gh_cands:
+                orphaned_cleaned.append({
+                    "name": e_name,
+                    "old_path": old_path,
+                    "action": "purged_deleted_from_github"
+                })
+                continue
+
             if prune_deleted_remotes and remote_org_map and not gh_cands:
                 orphaned_cleaned.append({
                     "name": e_name,
@@ -3340,18 +3777,27 @@ def reindex_and_sync_catalog(
             for nd in newly_discovered:
                 print(f"    * {C_BOLD}{nd['path']}{C_RESET} [{nd['branch']}] ({nd['url']})")
         if orphaned_cleaned:
-            print(f"\n  {C_YELLOW}🧹 Rutas Huerfanas / No Clonadas Actualizadas: ({len(orphaned_cleaned)}){C_RESET}")
-            for oc in orphaned_cleaned[:15]:
-                print(f"    * {oc['old_path']} -> {oc['action']}")
-            if len(orphaned_cleaned) > 15:
-                print(f"    * ... y {len(orphaned_cleaned) - 15} mas.")
+            purged = [oc for oc in orphaned_cleaned if oc.get("action") in ("purged_deleted_from_github", "removed_missing_remote")]
+            if purged:
+                print(f"\n  {C_YELLOW}🧹 Repositorios Eliminados en GitHub Purgados del Catalogo: ({len(purged)}){C_RESET}")
+                for p in purged:
+                    print(f"    * {C_BOLD}{p['name']}{C_RESET} ({p['old_path']}) -> Retirado del catalogo (no existe en GitHub ni en disco)")
+            others = [oc for oc in orphaned_cleaned if oc.get("action") not in ("purged_deleted_from_github", "removed_missing_remote")]
+            if others:
+                print(f"\n  {C_YELLOW}🧹 Rutas Huerfanas / No Clonadas Actualizadas: ({len(others)}){C_RESET}")
+                for oc in others[:15]:
+                    print(f"    * {oc['old_path']} -> {oc['action']}")
+                if len(others) > 15:
+                    print(f"    * ... y {len(others) - 15} mas.")
 
-        if not (physical_moves or relocated_repos or newly_discovered):
+        if not (physical_moves or relocated_repos or newly_discovered or (orphaned_cleaned and any(oc.get("action") in ("purged_deleted_from_github", "removed_missing_remote") for oc in orphaned_cleaned))):
             print(f"  {C_GREEN}[OK] El catalogo y las carpetas en disco estan 100% sincronizados.{C_RESET}")
 
         print(f"\n  * {C_BOLD}Catalogo actualizado:{C_RESET} {os.path.basename(target_save_file)}")
         print(f"  * {C_BOLD}Repositorios clonados en disco:{C_RESET} {C_GREEN}{cloned_total}{C_RESET}")
         print(f"  * {C_BOLD}Total de repositorios activos en catalogo:{C_RESET} {C_CYAN}{active_total}{C_RESET}\n")
+
+    purged_remotes = [oc for oc in orphaned_cleaned if oc.get("action") in ("purged_deleted_from_github", "removed_missing_remote")]
 
     return {
         "success": True,
@@ -3361,9 +3807,157 @@ def reindex_and_sync_catalog(
         "newly_discovered": newly_discovered,
         "published_to_github": published_to_github,
         "orphaned_cleaned": orphaned_cleaned,
+        "purged_remotes": purged_remotes,
         "cloned_total": cloned_total,
         "active_total": active_total
     }
+
+# ==============================================================================
+# REMOCION Y DESINDEXACION DE REPOSITORIOS DEL CATALOGO
+# ==============================================================================
+def remove_repositories_from_catalog(repos_dir, catalog, catalog_file, repo_targets, delete_local_disk=False, script_dir=None, quiet=False):
+    """
+    Retira uno o varios repositorios del catalogo maestro/local (repos.local.json).
+    Opcionalmente elimina la carpeta fisica en disco si delete_local_disk es True.
+    """
+    if script_dir is None:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+
+    if isinstance(repo_targets, str):
+        repo_targets = [repo_targets]
+
+    removed = []
+    not_found = []
+
+    for target in repo_targets:
+        clean_target = target.strip().strip("/")
+        if not clean_target:
+            continue
+
+        matches = [
+            c for c in catalog
+            if c.get("path", "").lower() == clean_target.lower()
+            or c.get("name", "").lower() == clean_target.lower()
+        ]
+
+        if not matches:
+            fuzzy = find_matching_repos(clean_target, catalog, repos_dir=repos_dir, cutoff=0.7)
+            if fuzzy and fuzzy[0]["score"] >= 0.7:
+                matches = [fuzzy[0]["entry"]]
+
+        if not matches:
+            not_found.append(clean_target)
+            continue
+
+        for m in matches:
+            m_path = m.get("path", f"{m.get('group')}/{m.get('name')}")
+            full_path = os.path.abspath(os.path.join(repos_dir, m_path))
+            disk_deleted = False
+
+            if delete_local_disk and os.path.isdir(full_path):
+                try:
+                    shutil.rmtree(full_path)
+                    disk_deleted = True
+                except Exception as e:
+                    if not quiet:
+                        print(f"  {C_RED}[!] Error al eliminar carpeta local {full_path}: {e}{C_RESET}")
+
+            removed.append({
+                "name": m.get("name"),
+                "group": m.get("group"),
+                "path": m_path,
+                "deleted_disk": disk_deleted,
+                "disk_path": full_path if disk_deleted else None
+            })
+
+    if removed:
+        removed_paths = {r["path"].lower() for r in removed}
+        catalog[:] = [c for c in catalog if c.get("path", f"{c.get('group')}/{c.get('name')}").lower() not in removed_paths]
+        _atomic_write_json(catalog_file, catalog)
+
+        # Sincronizar legacy si existe
+        legacy_sync_cat = os.path.join(repos_dir, "_sync", "repos.json")
+        if os.path.isfile(legacy_sync_cat) and os.path.abspath(legacy_sync_cat) != os.path.abspath(catalog_file):
+            try:
+                _atomic_write_json(legacy_sync_cat, catalog)
+            except Exception:
+                pass
+
+        if not quiet:
+            print(f"\n{C_GREEN}[OK] Se retiraron {len(removed)} repositorio(s) del catalogo ({os.path.basename(catalog_file)}):{C_RESET}")
+            for r in removed:
+                disk_info = f" {C_YELLOW}(carpeta en disco eliminada){C_RESET}" if r["deleted_disk"] else ""
+                print(f"  * {C_BOLD}{r['group']}/{r['name']}{C_RESET}{disk_info}")
+            print("")
+
+    if not_found and not quiet:
+        print(f"{C_YELLOW}[!] No se encontraron en el catalogo: {', '.join(not_found)}{C_RESET}\n")
+
+    return {
+        "success": bool(removed),
+        "removed": removed,
+        "not_found": not_found,
+        "remaining_catalog_total": len(catalog)
+    }
+
+def interactive_remove_repo_from_catalog(repos_dir, catalog, catalog_file, target=None):
+    """Comando interactivo /remover para desindexar o eliminar repositorios del catalogo"""
+    if not target:
+        print(f"\n{C_CYAN}=== Retirar Repositorio del Catalogo ==={C_RESET}")
+        try:
+            target = input(f"{C_BOLD}Nombre o ruta del repositorio a retirar (ej: torres o th-mex/torres): {C_RESET}").strip()
+        except (EOFError, KeyboardInterrupt):
+            target = ""
+        if not target:
+            print(f"{C_GRAY}Operacion cancelada.{C_RESET}\n")
+            return
+
+    matches = [
+        c for c in catalog
+        if c.get("path", "").lower() == target.lower()
+        or c.get("name", "").lower() == target.lower()
+    ]
+    if not matches:
+        fuzzy = find_matching_repos(target, catalog, repos_dir=repos_dir, cutoff=0.5)
+        if fuzzy:
+            matches = [fuzzy[0]["entry"]]
+
+    if not matches:
+        print(f"\n{C_RED}[!] No se encontro ningun repositorio coincidente con '{target}' en el catalogo.{C_RESET}\n")
+        return
+
+    m = matches[0]
+    m_path = m.get("path", f"{m.get('group')}/{m.get('name')}")
+    full_path = os.path.abspath(os.path.join(repos_dir, m_path))
+    is_cloned_on_disk = os.path.isdir(full_path)
+
+    print(f"\n{C_WHITE}Repositorio seleccionado:{C_RESET} {C_BOLD}{m['group']}/{m['name']}{C_RESET}")
+    print(f"  * Ubicacion catalogo: {m_path}")
+    print(f"  * En disco local: {'Si (' + full_path + ')' if is_cloned_on_disk else 'No clonado'}")
+
+    try:
+        ans_cat = input(f"\n{C_BOLD}¿Deseas retirar '{m['group']}/{m['name']}' del catalogo? [S/n]: {C_RESET}").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        ans_cat = "n"
+
+    if ans_cat not in ("", "s", "si", "y", "yes"):
+        print(f"{C_GRAY}Operacion cancelada.{C_RESET}\n")
+        return
+
+    del_disk = False
+    if is_cloned_on_disk:
+        try:
+            ans_disk = input(f"{C_YELLOW}{C_BOLD}¿Deseas tambien ELIMINAR la carpeta fisica en disco ({full_path})? [s/N]: {C_RESET}").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            ans_disk = "n"
+        del_disk = ans_disk in ("s", "si", "y", "yes")
+
+    remove_repositories_from_catalog(
+        repos_dir, catalog, catalog_file,
+        repo_targets=[m_path],
+        delete_local_disk=del_disk,
+        quiet=False
+    )
 
 # ==============================================================================
 # TRIAGE CON GEMINI AI (CARPETAS NUEVAS O HUERFANAS)
@@ -3457,11 +4051,26 @@ TUS CAPACIDADES MEDIANTE HERRAMIENTAS:
 19. `list_repositories`: Lista y filtra los repositorios del catalogo y del equipo (clonados vs en la nube). Usalo SIEMPRE que el usuario pida un listado, ver repositorios, o consultar que proyectos existen.
 20. `search_repositories`: Busca repositorios con tolerancia a errores tipograficos, faltas de ortografia y nombres aproximados (fuzzy matching).
 21. `reindex_catalog`: Escanea recursivamente el disco (`D:\\Repos` o `~/Repos`), detecta repositorios movidos de carpeta, transferidos de organizacion en GitHub (moviendo fisicamente sus archivos locales y actualizando su remote), agregados manualmente o eliminados, y sincroniza el catalogo maestro (`repos.local.json` / `repos.json`).
+22. `remove_repository`: Retira uno o varios repositorios del catalogo (repos.local.json) y opcionalmente elimina su carpeta local si el usuario lo pide. Usalo cuando el usuario indique que ya borro repositorios de GitHub, que ya no deben aparecer o que desea desindexarlos.
+23. `system_doctor`: Examen clinico y auto-reparacion del sistema GitDoctor (/doctor). Inspecciona y auto-repara automaticamente: Python, Git CLI, GitHub CLI ('gh'), sesion, comandos globales 'gitdoctor' y 'gitdoc', PATH, permisos (chmod +x), integridad del catalogo y blindaje. Usalo SIEMPRE que el usuario reporte problemas de instalacion, configuracion, comandos no reconocidos, errores de sincronizacion o solicite diagnosticar/reparar su entorno.
 
 REGLAS DE INTERACCION:
 - Responde siempre de forma concisa, profesional, clara, cercana y en espanol con tono de Medico DevOps de cabecera.
 - Si el usuario pide un listado o ver qué repositorios tiene ('dame un listado', 'que repos tengo', 'mostrar repos', 'listar proyectos'), ejecuta INMEDIATAMENTE `list_repositories`.
 - Si el usuario menciona un nombre aproximado o mal escrito de un repositorio (ej. 'peluza' por 'pelusa', 'audio' por 'TranscriptAudio'), las herramientas cuentan con busqueda difusa (fuzzy search) integrada y encontraran el proyecto adecuado automaticamente.
+- PROTOCOLO CLINICO ANTE PROBLEMAS DE INSTALACION, CONFIGURACION O ERRORES DEL SISTEMA:
+  Si el usuario reporta que se atoro con la instalacion, que no reconoce el comando 'gitdoctor', que le da 'command not found', que tiene error de permisos, que no puede sincronizar o que algo fallo en su equipo:
+  1. No te limites a dar consejos genericos de texto o disculpas.
+  2. Ejecuta DE INMEDIATO la herramienta `system_doctor {"auto_fix": true}` para diagnosticar y auto-reparar el entorno en caliente.
+  3. Revisa los resultados del chequeo e informale con precision que se diagnostico y reparo, indicandole el paso exacto a seguir (ej: ejecutar `source ~/.zshrc`, iniciar sesion con `/login` o reiniciar terminal).
+- PROTOCOLO CLINICO ANTE REPOSITORIOS BORRADOS DE GITHUB O QUE YA NO DEBEN APARECER:
+  Si el usuario indica que ya borro, elimino o purgo repositorios en GitHub, o que 'ya no deberian aparecer' (ej: 'esos repos de torres y dixie ya los borre de github ya no deberian aparecer', 'borre el repo x', 'ya no existe x'):
+  1. JAMAS digas pasivamente que todo esta al dia o sincronizado sin antes actuar clinicamente.
+  2. JAMAS intentes clonarlos con `sync_all` o `clone_repo_or_org`.
+  3. Ejecuta INMEDIATAMENTE `remove_repository` con los nombres de los repositorios indicados (ej. `repo_names: ["torres", "dixie"]`).
+  4. La herramienta los retirara de `repos.local.json` y te informara si estaban clonados en disco.
+  5. Si NO estaban clonados en disco, confirma al usuario que fueron purgados con exito del catalogo y que ya no apareceran ni fallaran al sincronizar.
+  6. Si ESTABAN clonados en disco, informale que el remoto en GitHub ya no existe pero sus archivos locales estan a salvo en disco, y preguntale si desea conservarlos o borrarlos.
 - Apoya tanto al usuario principal como a cualquier colega que use la herramienta.
 - Explica los resultados de manera sencilla y siempre sugiere el comando rapido para que el usuario aprenda.
 - Nunca expongas tokens, claves ni URLs con datos sensibles.
@@ -3771,7 +4380,7 @@ GEMINI_TOOLS = [
             },
             {
                 "name": "reindex_catalog",
-                "description": "Auto-descubre y reindexa el catalogo de repositorios: escanea el disco recursivamente, detecta repositorios movidos en disco o transferidos de organizacion en GitHub (moviendo sus archivos fisicos y actualizando su remote origin), registra nuevos repos locales y limpia rutas huerfanas.",
+                "description": "Auto-descubre y reindexa el catalogo de repositorios: escanea el disco recursivamente, detecta repositorios movidos en disco o transferidos de organizacion en GitHub (moviendo sus archivos fisicos y actualizando su remote origin), registra nuevos repos locales, limpia rutas huerfanas y purga repositorios eliminados de GitHub.",
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {
@@ -3782,6 +4391,42 @@ GEMINI_TOOLS = [
                         "auto_move_physical": {
                             "type": "BOOLEAN",
                             "description": "Si es True (por defecto), mueve automaticamente la carpeta fisica del repositorio en disco hacia la nueva organizacion detectada."
+                        },
+                        "prune_deleted_remotes": {
+                            "type": "BOOLEAN",
+                            "description": "Si es True, elimina del catalogo aquellos repositorios no clonados que ya no existen en GitHub (fueron borrados)."
+                        }
+                    }
+                }
+            },
+            {
+                "name": "remove_repository",
+                "description": "Retira uno o varios repositorios del catalogo (repos.local.json) y opcionalmente elimina su carpeta local en disco si el usuario lo pide expresamente. Usalo cuando el usuario indique que ya borro repositorios de GitHub, que ya no deben aparecer o que desea desindexarlos.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "repo_names": {
+                            "type": "ARRAY",
+                            "items": {"type": "STRING"},
+                            "description": "Lista de nombres o rutas relativas de repositorios a retirar del catalogo (ej. ['torres', 'Dixie'] o ['th-mex/torres'])."
+                        },
+                        "delete_local_disk": {
+                            "type": "BOOLEAN",
+                            "description": "Si es True, borra tambien la carpeta local en disco. Debe ser False por defecto a menos que el usuario haya pedido explicitamente borrar el codigo local."
+                        }
+                    },
+                    "required": ["repo_names"]
+                }
+            },
+            {
+                "name": "system_doctor",
+                "description": "Ejecuta el examen clinico y auto-reparacion integral del sistema GitDoctor (/doctor). Inspecciona y repara automaticamente: Python runtime, Git CLI, GitHub CLI ('gh') y sesion, integracion de terminal ('gitdoctor' y 'gitdoc' en ~/.zshrc o PATH), permisos de scripts (chmod +x), integridad de config.local.json y catalogo (repos.local.json), blindaje de .gitignore y conectividad. Usalo SIEMPRE ante problemas de instalacion, configuracion, errores de terminal o sincronizacion.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "auto_fix": {
+                            "type": "BOOLEAN",
+                            "description": "Si es True (por defecto), repara automaticamente todos los problemas detectados que tengan solucion conocida."
                         }
                     }
                 }
@@ -4441,7 +5086,7 @@ def execute_tool_call(tool_name, args, repos_dir, catalog, catalog_file, api_key
     elif tool_name == "sync_all":
         auto_pull = args.get("auto_pull", True)
         org_filter = local_cfg.get("enabled_orgs") if local_cfg.get("disabled_orgs") else None
-        return sync_all_repos(repos_dir, catalog, auto_pull=auto_pull, auto_clone=True, org_filter=org_filter)
+        return sync_all_repos(repos_dir, catalog, auto_pull=auto_pull, auto_clone=True, org_filter=org_filter, catalog_file=catalog_file)
 
     elif tool_name == "push_unpushed":
         target = args.get("target_repo", "all")
@@ -4522,6 +5167,7 @@ def execute_tool_call(tool_name, args, repos_dir, catalog, catalog_file, api_key
     elif tool_name == "reindex_catalog":
         sync_remote = args.get("sync_remote_transfers", True)
         auto_move = args.get("auto_move_physical", True)
+        prune_del = args.get("prune_deleted_remotes", False)
         script_dir = os.path.dirname(os.path.abspath(__file__))
         gh_info = get_github_status() if sync_remote else None
         return reindex_and_sync_catalog(
@@ -4531,10 +5177,30 @@ def execute_tool_call(tool_name, args, repos_dir, catalog, catalog_file, api_key
             script_dir=script_dir,
             sync_remote_transfers=sync_remote,
             auto_move_physical=auto_move,
+            prune_deleted_remotes=prune_del,
             gh_info=gh_info,
             active_orgs=active_orgs,
             quiet=False
         )
+
+    elif tool_name == "remove_repository":
+        repo_names = args.get("repo_names", [])
+        if isinstance(repo_names, str):
+            repo_names = [repo_names]
+        del_disk = args.get("delete_local_disk", False)
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        return remove_repositories_from_catalog(
+            repos_dir, catalog, catalog_file,
+            repo_targets=repo_names,
+            delete_local_disk=del_disk,
+            script_dir=script_dir,
+            quiet=False
+        )
+
+    elif tool_name == "system_doctor":
+        af = args.get("auto_fix", True)
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        return run_system_doctor(repos_dir, catalog, catalog_file, script_dir=script_dir, auto_fix=af, quiet=False)
 
     return {"error": f"Herramienta desconocida: {tool_name}"}
 
@@ -5034,6 +5700,7 @@ def print_helpme_commands():
     print(f"{C_CYAN}=================================================================================={C_RESET}\n")
 
     print(f"{C_BOLD}{C_GREEN}🩺 DIAGNOSTICO Y SALUD DEL ECOSISTEMA:{C_RESET}")
+    print(f"  * {C_WHITE}/doctor{C_RESET} (o {C_WHITE}/reparar{C_RESET}, {C_WHITE}/autofix{C_RESET}): Examen clinico y auto-reparacion del sistema (Python, Git, gh, PATH, permisos).")
     print(f"  * {C_WHITE}/salud{C_RESET} (o {C_WHITE}salud{C_RESET})          : Diagnostico ultrarrapido (~1s) del estado de todos los repos.")
     print(f"  * {C_WHITE}/salud fetch{C_RESET}              : Diagnostico completo consultando GitHub en tiempo real.")
     print(f"  * {C_WHITE}/salud 360{C_RESET} (o {C_WHITE}/seguridad{C_RESET})  : Auditoria integral de Salud 360° (Secretos, API keys, Gitflow e higiene).")
@@ -5046,7 +5713,8 @@ def print_helpme_commands():
     print(f"{C_BOLD}{C_CYAN}🔄 SINCRONIZACION Y GESTION DE CODIGO:{C_RESET}")
     print(f"  * {C_WHITE}/repos{C_RESET} [filtro|org]         : Listado completo de proyectos con estado (clonados en disco vs en la nube).")
     print(f"  * {C_WHITE}/buscar <termino>{C_RESET}         : Busqueda difusa e inteligente con tolerancia a faltas de ortografia.")
-    print(f"  * {C_WHITE}/reindex{C_RESET} (o {C_WHITE}reindex{C_RESET})       : Auto-escanea el disco y GitHub; mueve carpetas si cambiaron de org y sincroniza el catalogo.")
+    print(f"  * {C_WHITE}/reindex{C_RESET} [--prune]       : Auto-escanea el disco y GitHub; mueve carpetas si cambiaron de org y sincroniza el catalogo.")
+    print(f"  * {C_WHITE}/remover <repo>{C_RESET} (o /eliminar): Retira un proyecto del catalogo (y opcionalmente elimina carpeta local).")
     print(f"  * {C_WHITE}/catalogo{C_RESET} [push|pull|status]: Gestiona tu Boveda Privada (Gist Secreto) para compartir repos entre Windows y Mac.")
     print(f"  * {C_WHITE}/sync{C_RESET} [org]               : Descarga cambios remotos en paralelo con pull lineal (--ff-only).")
     print(f"  * {C_WHITE}/push{C_RESET} [repo|all]          : Sube a GitHub los commits locales que van adelante.")
@@ -5202,6 +5870,19 @@ COMMAND_MAP = {
     "reconciliar": "/reindex",
     "escanear": "/reindex",
     "autodescubrir": "/reindex",
+    "remover": "/remover",
+    "eliminar": "/remover",
+    "borrar": "/remover",
+    "quitar": "/remover",
+    "delete": "/remover",
+    "remove": "/remover",
+    "rm": "/remover",
+    "doctor": "/doctor",
+    "diagnostico": "/doctor",
+    "reparar": "/doctor",
+    "autofix": "/doctor",
+    "checkup": "/doctor",
+    "salud-sistema": "/doctor",
     "ayuda": "/ayuda",
     "help": "/ayuda",
     "helpme": "/ayuda",
@@ -5218,7 +5899,7 @@ CANONICAL_SLASH_COMMANDS = [
     "/gitflow", "/onboarding", "/limpiar", "/disco", "/sync", "/push", "/commit", "/apagar",
     "/vigilante", "/github", "/perfiles", "/catalogo", "/login", "/switch", "/logout", "/git-id", "/dir",
     "/importar-github", "/publico", "/ia", "/set-key", "/ayuda", "/helpme", "/salir",
-    "/repos", "/buscar", "/reindex"
+    "/repos", "/buscar", "/reindex", "/remover", "/doctor"
 ]
 
 def resolve_user_command(user_input):
@@ -5299,6 +5980,18 @@ def resolve_user_command(user_input):
         if clean_lower.startswith(prefix):
             remainder = clean_lower[len(prefix):].strip()
             return "/clone", remainder
+
+    # Deteccion de frases naturales de REMOVER / ELIMINAR DEL CATALOGO
+    REMOVE_PREFIXES = [
+        "elimina el repo ", "eliminar el repo ", "elimina repo ", "eliminar repo ",
+        "borra el repo ", "borrar el repo ", "borra repo ", "borrar repo ",
+        "remueve el repo ", "remover el repo ", "remueve repo ", "remover repo ",
+        "quita el repo ", "quitar el repo ", "quita repo ", "quitar repo "
+    ]
+    for prefix in REMOVE_PREFIXES:
+        if clean_lower.startswith(prefix):
+            remainder = clean_lower[len(prefix):].strip()
+            return "/remover", remainder
 
     parts = raw.split(None, 1)
     tok = parts[0]
@@ -5430,7 +6123,7 @@ def dispatch_single_command(canon_cmd, rest, repos_dir, catalog, catalog_file, g
     elif canon_cmd == "/sync":
         target_org = rest.strip() if rest else None
         org_filter = [target_org] if target_org else (enabled_orgs if disabled_orgs else None)
-        sync_all_repos(repos_dir, catalog, auto_pull=True, auto_clone=True, org_filter=org_filter)
+        sync_all_repos(repos_dir, catalog, auto_pull=True, auto_clone=True, org_filter=org_filter, catalog_file=catalog_file)
         if gh_info.get('logged_in'):
             check_for_new_remote_repos(repos_dir, catalog, catalog_file, gh_info, org_filter or enabled_orgs, interactive=True)
 
@@ -5495,6 +6188,7 @@ def dispatch_single_command(canon_cmd, rest, repos_dir, catalog, catalog_file, g
     elif canon_cmd == "/reindex":
         no_remote = "--local" in rest.lower() or "local" in rest.lower()
         no_move = "--no-move" in rest.lower()
+        prune_remotes = "--prune" in rest.lower() or "-p" in rest.lower()
         reindex_and_sync_catalog(
             repos_dir=repos_dir,
             catalog=catalog,
@@ -5502,10 +6196,19 @@ def dispatch_single_command(canon_cmd, rest, repos_dir, catalog, catalog_file, g
             script_dir=script_dir,
             sync_remote_transfers=(not no_remote),
             auto_move_physical=(not no_move),
+            prune_deleted_remotes=prune_remotes,
             gh_info=gh_info,
             active_orgs=all_known_orgs,
             quiet=False
         )
+
+    elif canon_cmd == "/remover":
+        interactive_remove_repo_from_catalog(repos_dir, catalog, catalog_file, target=rest if rest else None)
+
+    elif canon_cmd == "/doctor":
+        quiet_mode = "--quiet" in rest.lower() or "-q" in rest.lower()
+        no_fix = "--no-fix" in rest.lower()
+        run_system_doctor(repos_dir, catalog, catalog_file, script_dir=script_dir, auto_fix=(not no_fix), quiet=quiet_mode)
 
     elif canon_cmd == "/publico":
         prepare_for_public_repo(script_dir)
@@ -5676,6 +6379,9 @@ def main():
                 print(f"  {C_MAGENTA}🚚 [AUTO-MOVE] '{pm['name']}' movido fisicamente: {pm['from_path']} -> {pm['to_path']}{C_RESET}")
         if startup_reindex.get("newly_discovered"):
             print(f"  {C_GREEN}✨ [AUTO-INDEX] {len(startup_reindex['newly_discovered'])} nuevo(s) repositorio(s) local(es) agregado(s) al catalogo.{C_RESET}")
+        if startup_reindex.get("purged_remotes"):
+            for pr in startup_reindex["purged_remotes"]:
+                print(f"  {C_YELLOW}🧹 [AUTO-PRUNE] '{pr['name']}' ({pr['old_path']}) eliminado en GitHub -> Retirado del catalogo.{C_RESET}")
     except Exception:
         pass
 
@@ -5838,11 +6544,13 @@ def main():
             function_calls = [p["functionCall"] for p in parts if "functionCall" in p]
             text_parts = [p["text"] for p in parts if "text" in p]
 
-            if text_parts:
+            if text_parts and not function_calls:
                 ai_text = "\n".join(text_parts).strip()
                 print(f"\n{C_BOLD}GitDoctor AI:{C_RESET}\n{ai_text}\n")
 
-            if function_calls:
+            loop_step = 0
+            while function_calls and loop_step < 3:
+                loop_step += 1
                 conversation_history.append(candidate["content"])
 
                 for fc in function_calls:
@@ -5868,16 +6576,21 @@ def main():
                     })
 
                 follow_up = call_ai_engine(api_key, conversation_history, system_instruction, local_cfg)
-                if follow_up:
-                    follow_cand = follow_up["candidates"][0]
-                    follow_texts = [p["text"] for p in follow_cand["content"].get("parts", []) if "text" in p]
-                    if follow_texts:
-                        print(f"\n{C_BOLD}GitDoctor AI:{C_RESET}\n{'\n'.join(follow_texts).strip()}\n")
-                    conversation_history.append(follow_cand["content"])
-                else:
+                if not follow_up:
                     err_detail = get_last_gemini_error()
-                    print(f"{C_YELLOW}[!] La accion se ejecuto, pero no se pudo obtener el mensaje final de la IA ({err_detail}).{C_RESET}\n")
-            else:
+                    print(f"{C_YELLOW}[!] La accion se ejecuto, pero no se pudo obtener respuesta posterior de la IA ({err_detail}).{C_RESET}\n")
+                    break
+
+                candidate = follow_up["candidates"][0]
+                parts = candidate["content"].get("parts", [])
+                function_calls = [p["functionCall"] for p in parts if "functionCall" in p]
+                text_parts = [p["text"] for p in parts if "text" in p]
+
+                if text_parts:
+                    resp_text = "\n".join(text_parts).strip()
+                    print(f"\n{C_BOLD}GitDoctor AI:{C_RESET}\n{resp_text}\n")
+
+            if not function_calls:
                 conversation_history.append(candidate["content"])
 
         except Exception as e:

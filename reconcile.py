@@ -10,7 +10,7 @@ import subprocess
 
 try:
     from agent import reindex_and_sync_catalog
-except ImportError:
+except (ImportError, Exception):
     reindex_and_sync_catalog = None
 
 C_RESET = "\033[0m"
