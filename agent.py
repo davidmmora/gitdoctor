@@ -23,13 +23,16 @@ import subprocess
 import urllib.request
 import urllib.error
 import urllib.parse
+import webbrowser
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
 try:
-    from onboarding import run_onboarding_assistant
+    from onboarding import run_onboarding_assistant, configure_ai_provider, save_env_var
 except ImportError:
     run_onboarding_assistant = None
+    configure_ai_provider = None
+    save_env_var = None
 
 # Configurar encoding UTF-8 seguro para consolas Windows y Mac
 if hasattr(sys.stdout, 'reconfigure'):
@@ -467,31 +470,24 @@ def ensure_env_in_gitignore(script_dir):
         except Exception:
             pass
 
-def save_gemini_api_key(script_dir, key):
-    """Guarda la API key en _sync/.env con permisos restringidos"""
-    key = key.strip()
-    if not key:
-        return False
-
+def save_env_var_local(script_dir, var_name, value):
+    """Guarda o actualiza una variable en .env de forma segura y restringe permisos a 0600"""
     ensure_env_in_gitignore(script_dir)
     env_path = os.path.join(script_dir, ".env")
-
     existing_lines = []
     if os.path.isfile(env_path):
         try:
             with open(env_path, "r", encoding="utf-8") as f:
                 for line in f:
-                    if not line.strip().startswith("GEMINI_API_KEY="):
+                    if not line.strip().startswith(f"{var_name}="):
                         existing_lines.append(line)
         except Exception:
             pass
 
-    existing_lines.append(f"GEMINI_API_KEY={key}\n")
-
+    existing_lines.append(f"{var_name}={value.strip()}\n")
     try:
         with open(env_path, "w", encoding="utf-8") as f:
             f.writelines(existing_lines)
-
         if hasattr(os, 'chmod') and os.name != 'nt':
             try:
                 os.chmod(env_path, 0o600)
@@ -499,22 +495,44 @@ def save_gemini_api_key(script_dir, key):
                 pass
         return True
     except Exception as e:
-        print(f"{C_RED}[ERROR] No se pudo guardar la clave: {sanitize_error(e)}{C_RESET}")
+        print(f"{C_RED}[ERROR] No se pudo guardar {var_name}: {sanitize_error(e)}{C_RESET}")
         return False
 
-def load_gemini_api_key(script_dir, interactive=False):
-    """Carga la API key desde variable de entorno o archivo .env"""
-    key = os.environ.get("GEMINI_API_KEY", "").strip()
-    if key:
-        return key
+def save_gemini_api_key(script_dir, key):
+    """Guarda la API key de Gemini en .env con permisos restringidos"""
+    if save_env_var:
+        return save_env_var(script_dir, "GEMINI_API_KEY", key)
+    return save_env_var_local(script_dir, "GEMINI_API_KEY", key)
 
+def load_ai_api_key(script_dir, provider=None, interactive=False):
+    """Carga la API key para el proveedor de IA configurado desde variables de entorno o .env"""
+    if not provider:
+        cfg = load_local_config(script_dir)
+        provider = cfg.get("ai_provider", "gemini")
+
+    if provider in ["ollama", "none"]:
+        return None
+
+    var_name = {
+        "gemini": "GEMINI_API_KEY",
+        "openai": "OPENAI_API_KEY",
+        "anthropic": "ANTHROPIC_API_KEY",
+        "aws": "AWS_ACCESS_KEY_ID"
+    }.get(provider, "GEMINI_API_KEY")
+
+    # 1. Variable en proceso / entorno
+    val = os.environ.get(var_name, "").strip()
+    if val:
+        return val
+
+    # 2. Archivo .env
     env_path = os.path.join(script_dir, ".env")
     if os.path.isfile(env_path):
         try:
             with open(env_path, "r", encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
-                    if line.startswith("GEMINI_API_KEY="):
+                    if line.startswith(f"{var_name}="):
                         k = line.split("=", 1)[1].strip().strip('"').strip("'")
                         if k:
                             return k
@@ -524,27 +542,38 @@ def load_gemini_api_key(script_dir, interactive=False):
     if not interactive:
         return None
 
-    print(f"\n{C_YELLOW}+--------------------------------------------------------+{C_RESET}")
-    print(f"{C_YELLOW}|  Configuracion de Seguridad para Gemini AI             |{C_RESET}")
-    print(f"{C_YELLOW}+--------------------------------------------------------+{C_RESET}")
-    print(f"{C_GRAY}Tu API Key se guardara en {C_WHITE}_sync/.env{C_GRAY} (ignorado por Git con .gitignore).{C_RESET}")
-    print(f"{C_GRAY}Si no tienes una o prefieres omitir, presiona Enter para usar comandos locales.{C_RESET}\n")
+    # Configuracion interactiva multi-proveedor
+    if configure_ai_provider:
+        cfg = load_local_config(script_dir)
+        updated_cfg = configure_ai_provider(script_dir, cfg)
+        save_local_config(script_dir, updated_cfg)
+        chosen_p = updated_cfg.get("ai_provider", "gemini")
+        return load_ai_api_key(script_dir, chosen_p, interactive=False)
 
+    # Fallback si configure_ai_provider no esta disponible
+    print(f"\n{C_YELLOW}+--------------------------------------------------------+{C_RESET}")
+    print(f"{C_YELLOW}|  Configuracion de Clave para {var_name:<26}|{C_RESET}")
+    print(f"{C_YELLOW}+--------------------------------------------------------+{C_RESET}")
     user_key = ""
     try:
-        user_key = getpass.getpass(f"{C_BOLD}Introduce tu Gemini API Key: {C_RESET}").strip()
+        user_key = getpass.getpass(f"{C_BOLD}Introduce tu clave ({var_name}): {C_RESET}").strip()
     except Exception:
         try:
-            user_key = input(f"{C_BOLD}Introduce tu Gemini API Key: {C_RESET}").strip()
+            user_key = input(f"{C_BOLD}Introduce tu clave ({var_name}): {C_RESET}").strip()
         except EOFError:
             user_key = ""
 
     if user_key:
-        if save_gemini_api_key(script_dir, user_key):
-            print(f"{C_GREEN}[OK] API Key guardada exitosamente y protegida localmente.{C_RESET}\n")
+        save_fn = save_env_var if save_env_var else save_env_var_local
+        if save_fn(script_dir, var_name, user_key):
+            print(f"{C_GREEN}[OK] Clave guardada exitosamente y protegida localmente.{C_RESET}\n")
             return user_key
 
     return None
+
+def load_gemini_api_key(script_dir, interactive=False):
+    """Carga la API key de Gemini (compatibilidad hacia atras)"""
+    return load_ai_api_key(script_dir, provider="gemini", interactive=interactive)
 
 # ==============================================================================
 # GESTION DE SESION Y PERFIL DE GITHUB (gh CLI)
@@ -1316,7 +1345,8 @@ def open_repo_in_vscode(repos_dir, catalog, query):
             win_code = os.path.join(localapp, 'Programs', 'Microsoft VS Code', 'bin', 'code.cmd')
             if os.path.isfile(win_code):
                 try:
-                    subprocess.Popen([win_code, full_path], shell=True)
+                    comspec = os.environ.get('COMSPEC', 'cmd.exe')
+                    subprocess.Popen([comspec, '/c', win_code, full_path], shell=False)
                     opened = True
                 except Exception:
                     pass
@@ -3833,18 +3863,213 @@ def call_ollama_api(host, model, conversation_history, system_instruction):
         _LAST_GEMINI_ERROR = f"Error en Ollama ({host}, modelo '{model}'): {sanitize_error(e)}"
         return None
 
+def call_openai_api(api_key, model, conversation_history, system_instruction):
+    """Llama a la API de OpenAI (ChatGPT) para modelos GPT-4o, GPT-4, etc."""
+    global _LAST_GEMINI_ERROR
+    _LAST_GEMINI_ERROR = ""
+
+    if not api_key:
+        _LAST_GEMINI_ERROR = "Falta OPENAI_API_KEY. Configurala con /set-key."
+        return None
+
+    url = "https://api.openai.com/v1/chat/completions"
+    messages = [{"role": "system", "content": system_instruction}]
+
+    for turn in conversation_history:
+        role = turn.get("role", "user")
+        if role == "model":
+            role = "assistant"
+        parts = turn.get("parts", [])
+        text = ""
+        for p in parts:
+            if "text" in p:
+                text += p["text"]
+            elif "functionCall" in p:
+                text += f"\n[Accion solicitada: {p['functionCall']['name']}({json.dumps(p['functionCall'].get('args', {}))})]\n"
+            elif "functionResponse" in p:
+                text += f"\n[Resultado de accion: {json.dumps(p['functionResponse'].get('response', {}))}]\n"
+        if text:
+            messages.append({"role": role, "content": text})
+
+    payload = {
+        "model": model or "gpt-4o",
+        "messages": messages,
+        "temperature": 0.3
+    }
+    data_bytes = json.dumps(payload).encode("utf-8")
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    req = urllib.request.Request(url, data=data_bytes, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            resp_data = json.loads(resp.read().decode("utf-8"))
+            msg = resp_data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            return {
+                "candidates": [
+                    {
+                        "content": {
+                            "role": "model",
+                            "parts": [{"text": msg}]
+                        }
+                    }
+                ]
+            }
+    except urllib.error.HTTPError as e:
+        err_msg = ""
+        try:
+            err_data = json.loads(e.read().decode("utf-8"))
+            err_msg = err_data.get("error", {}).get("message", "")
+        except Exception:
+            pass
+        _LAST_GEMINI_ERROR = f"OpenAI HTTP {e.code}: {err_msg or e.reason}"
+        return None
+    except Exception as e:
+        _LAST_GEMINI_ERROR = f"Error en OpenAI: {sanitize_error(e)}"
+        return None
+
+def call_anthropic_api(api_key, model, conversation_history, system_instruction):
+    """Llama a la API de Anthropic para modelos Claude 3.5 Sonnet / Haiku"""
+    global _LAST_GEMINI_ERROR
+    _LAST_GEMINI_ERROR = ""
+
+    if not api_key:
+        _LAST_GEMINI_ERROR = "Falta ANTHROPIC_API_KEY. Configurala con /set-key."
+        return None
+
+    url = "https://api.anthropic.com/v1/messages"
+    messages = []
+    for turn in conversation_history:
+        role = turn.get("role", "user")
+        if role == "model":
+            role = "assistant"
+        parts = turn.get("parts", [])
+        text = ""
+        for p in parts:
+            if "text" in p:
+                text += p["text"]
+            elif "functionCall" in p:
+                text += f"\n[Accion solicitada: {p['functionCall']['name']}({json.dumps(p['functionCall'].get('args', {}))})]\n"
+            elif "functionResponse" in p:
+                text += f"\n[Resultado de accion: {json.dumps(p['functionResponse'].get('response', {}))}]\n"
+        if text:
+            messages.append({"role": role, "content": text})
+
+    if not messages:
+        messages = [{"role": "user", "content": "Hola"}]
+
+    payload = {
+        "model": model or "claude-3-5-sonnet-20241022",
+        "max_tokens": 4096,
+        "system": system_instruction,
+        "messages": messages,
+        "temperature": 0.3
+    }
+    data_bytes = json.dumps(payload).encode("utf-8")
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json"
+    }
+    req = urllib.request.Request(url, data=data_bytes, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            resp_data = json.loads(resp.read().decode("utf-8"))
+            text_parts = [c.get("text", "") for c in resp_data.get("content", []) if c.get("type") == "text"]
+            return {
+                "candidates": [
+                    {
+                        "content": {
+                            "role": "model",
+                            "parts": [{"text": "\n".join(text_parts)}]
+                        }
+                    }
+                ]
+            }
+    except urllib.error.HTTPError as e:
+        err_msg = ""
+        try:
+            err_data = json.loads(e.read().decode("utf-8"))
+            err_msg = err_data.get("error", {}).get("message", "")
+        except Exception:
+            pass
+        _LAST_GEMINI_ERROR = f"Anthropic HTTP {e.code}: {err_msg or e.reason}"
+        return None
+    except Exception as e:
+        _LAST_GEMINI_ERROR = f"Error en Anthropic: {sanitize_error(e)}"
+        return None
+
+def call_aws_bedrock_api(conversation_history, system_instruction, local_cfg):
+    """Invoca modelos en Amazon Bedrock mediante boto3"""
+    global _LAST_GEMINI_ERROR
+    _LAST_GEMINI_ERROR = ""
+    try:
+        import boto3
+    except ImportError:
+        _LAST_GEMINI_ERROR = "Para usar AWS Bedrock se requiere 'boto3'. Instalalo con: pip install boto3"
+        return None
+
+    region = local_cfg.get("aws_region") or os.environ.get("AWS_REGION", "us-east-1")
+    model = local_cfg.get("aws_bedrock_model", "anthropic.claude-3-5-sonnet-20241022-v2:0")
+    try:
+        client = boto3.client("bedrock-runtime", region_name=region)
+        messages = []
+        for turn in conversation_history:
+            role = turn.get("role", "user")
+            if role == "model":
+                role = "assistant"
+            parts = turn.get("parts", [])
+            text = "".join([p["text"] for p in parts if "text" in p])
+            if text:
+                messages.append({"role": role, "content": text})
+        if not messages:
+            messages = [{"role": "user", "content": "Hola"}]
+
+        body = json.dumps({
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 4096,
+            "system": system_instruction,
+            "messages": messages,
+            "temperature": 0.3
+        })
+        resp = client.invoke_model(body=body, modelId=model)
+        resp_data = json.loads(resp.get("body").read().decode("utf-8"))
+        text_parts = [c.get("text", "") for c in resp_data.get("content", []) if c.get("type") == "text"]
+        return {
+            "candidates": [
+                {
+                    "content": {
+                        "role": "model",
+                        "parts": [{"text": "\n".join(text_parts)}]
+                    }
+                }
+            ]
+        }
+    except Exception as e:
+        _LAST_GEMINI_ERROR = f"Error en AWS Bedrock ({region}): {sanitize_error(e)}"
+        return None
+
 def call_ai_engine(api_key, conversation_history, system_instruction, local_cfg):
-    """Enrutador de IA inteligente: despacha a Ollama Local o Gemini Cloud segun configuracion"""
+    """Enrutador de IA inteligente: despacha al motor activo segun configuracion"""
     provider = local_cfg.get("ai_provider", "gemini")
     if provider == "ollama":
         host = local_cfg.get("ollama_host", "http://localhost:11434")
         model = local_cfg.get("ollama_model", "llama3.1")
         return call_ollama_api(host, model, conversation_history, system_instruction)
+    elif provider == "openai":
+        model = local_cfg.get("openai_model", "gpt-4o")
+        return call_openai_api(api_key, model, conversation_history, system_instruction)
+    elif provider == "anthropic":
+        model = local_cfg.get("anthropic_model", "claude-3-5-sonnet-20241022")
+        return call_anthropic_api(api_key, model, conversation_history, system_instruction)
+    elif provider in ["aws", "bedrock"]:
+        return call_aws_bedrock_api(conversation_history, system_instruction, local_cfg)
     else:
         return call_gemini_api(api_key, conversation_history, system_instruction)
 
 def interactive_switch_ai(local_cfg, script_dir, target=None):
-    """Permite consultar o cambiar el motor de IA entre Google Gemini y Ollama Local"""
+    """Permite consultar o cambiar el motor de IA entre Google Gemini, OpenAI, Anthropic, AWS y Ollama"""
     ollama_info = probe_ollama_status()
     current = local_cfg.get("ai_provider", "gemini")
 
@@ -3862,10 +4087,25 @@ def interactive_switch_ai(local_cfg, script_dir, target=None):
             save_local_config(script_dir, local_cfg)
             print(f"\n{C_GREEN}[OK] Motor de IA cambiado a: Ollama Local (Modelo: {local_cfg['ollama_model']}){C_RESET}\n")
             return local_cfg
-        elif "gemini" in t or "cloud" in t:
+        elif "gemini" in t or "google" in t:
             local_cfg["ai_provider"] = "gemini"
             save_local_config(script_dir, local_cfg)
             print(f"\n{C_GREEN}[OK] Motor de IA cambiado a: Google Gemini Cloud.{C_RESET}\n")
+            return local_cfg
+        elif "openai" in t or "chatgpt" in t or "gpt" in t:
+            local_cfg["ai_provider"] = "openai"
+            save_local_config(script_dir, local_cfg)
+            print(f"\n{C_GREEN}[OK] Motor de IA cambiado a: OpenAI (ChatGPT).{C_RESET}\n")
+            return local_cfg
+        elif "anthropic" in t or "claude" in t:
+            local_cfg["ai_provider"] = "anthropic"
+            save_local_config(script_dir, local_cfg)
+            print(f"\n{C_GREEN}[OK] Motor de IA cambiado a: Anthropic Claude.{C_RESET}\n")
+            return local_cfg
+        elif "aws" in t or "bedrock" in t:
+            local_cfg["ai_provider"] = "aws"
+            save_local_config(script_dir, local_cfg)
+            print(f"\n{C_GREEN}[OK] Motor de IA cambiado a: AWS Bedrock.{C_RESET}\n")
             return local_cfg
 
     print(f"\n{C_CYAN}=================================================================={C_RESET}")
@@ -3873,41 +4113,45 @@ def interactive_switch_ai(local_cfg, script_dir, target=None):
     print(f"{C_CYAN}=================================================================={C_RESET}\n")
     print(f"Motor actualmente activo: {C_BOLD}{C_GREEN}{current.upper()}{C_RESET}\n")
 
-    print(f"Opciones disponibles:")
-    print(f"  [1] Google Gemini Cloud (Gratuito con API Key en la nube)")
-    status_ollama = f"{C_GREEN}[En ejecucion en localhost:11434]{C_RESET}" if ollama_info["available"] else f"{C_GRAY}[No detectado]{C_RESET}"
-    models_str = f" - Modelos: {', '.join(ollama_info['models'][:3])}" if ollama_info["models"] else ""
-    print(f"  [2] Ollama Local Offline {status_ollama}{models_str} (100% privado, sin limites)")
+    status_ollama = f"{C_GREEN}[Activo en localhost:11434]{C_RESET}" if ollama_info["available"] else f"{C_GRAY}[No detectado]{C_RESET}"
+    models_str = f" ({', '.join(ollama_info['models'][:3])})" if ollama_info["models"] else ""
+
+    providers = [
+        ("1", "gemini", "Google Gemini / Google Cloud (Cuota gratuita en la nube)"),
+        ("2", "openai", "OpenAI / ChatGPT (GPT-4o, o1)"),
+        ("3", "anthropic", "Anthropic Claude (Claude 3.5 Sonnet / Haiku)"),
+        ("4", "aws", "AWS Bedrock / Amazon Web Services"),
+        ("5", "ollama", f"Ollama Local Offline {status_ollama}{models_str} (100% privado)")
+    ]
+
+    for num, pid, desc in providers:
+        marker = f" {C_GREEN}<- Activo{C_RESET}" if pid == current else ""
+        print(f"  [{num}] {desc}{marker}")
 
     try:
-        ans = input(f"\n{C_BOLD}Selecciona motor [1/2] (Enter para mantener {current}): {C_RESET}").strip()
+        ans = input(f"\n{C_BOLD}Selecciona motor [1-5] (Enter para mantener {current}): {C_RESET}").strip()
     except (EOFError, KeyboardInterrupt):
         ans = ""
 
-    if ans == "1":
-        local_cfg["ai_provider"] = "gemini"
-        save_local_config(script_dir, local_cfg)
-        print(f"\n{C_GREEN}[OK] Motor configurado: Google Gemini Cloud.{C_RESET}\n")
-    elif ans == "2":
-        local_cfg["ai_provider"] = "ollama"
-        if ollama_info["models"]:
-            print(f"\nModelos disponibles en tu Ollama:")
-            for idx, m in enumerate(ollama_info["models"], 1):
-                print(f"  [{idx}] {m}")
-            try:
-                m_ans = input(f"{C_BOLD}Elige modelo [1-{len(ollama_info['models'])}] (Enter para {ollama_info['models'][0]}): {C_RESET}").strip()
-                if m_ans.isdigit() and 1 <= int(m_ans) <= len(ollama_info["models"]):
-                    local_cfg["ollama_model"] = ollama_info["models"][int(m_ans)-1]
-                else:
-                    local_cfg["ollama_model"] = ollama_info["models"][0]
-            except Exception:
+    mapping = {"1": "gemini", "2": "openai", "3": "anthropic", "4": "aws", "5": "ollama"}
+    if ans in mapping:
+        chosen = mapping[ans]
+        local_cfg["ai_provider"] = chosen
+        if chosen == "ollama":
+            if ollama_info["models"]:
                 local_cfg["ollama_model"] = ollama_info["models"][0]
-        else:
-            local_cfg["ollama_model"] = "llama3.1"
-            print(f"\n{C_YELLOW}[INFO] No se detectaron modelos descargados en Ollama. Puedes descargar uno con: ollama run llama3.1{C_RESET}")
-
+            else:
+                local_cfg["ollama_model"] = "llama3.1"
         save_local_config(script_dir, local_cfg)
-        print(f"\n{C_GREEN}[OK] Motor configurado: Ollama Local (Modelo: {local_cfg['ollama_model']}).{C_RESET}\n")
+
+        key = load_ai_api_key(script_dir, chosen, interactive=False)
+        if chosen != "ollama" and not key:
+            print(f"\n{C_YELLOW}[!] Has seleccionado {chosen.upper()} pero aun no tienes su clave configurada.{C_RESET}")
+            if configure_ai_provider:
+                local_cfg = configure_ai_provider(script_dir, local_cfg)
+                save_local_config(script_dir, local_cfg)
+        else:
+            print(f"\n{C_GREEN}[OK] Motor configurado: {chosen.upper()}.{C_RESET}\n")
 
     return local_cfg
 
@@ -4718,9 +4962,9 @@ def print_helpme_commands():
     print(f"  * {C_WHITE}/publico{C_RESET}                  : Protege tus repos privados para poder publicar GitDoctor en GitHub.\n")
 
     print(f"{C_BOLD}{C_WHITE}🛡️ INTELIGENCIA ARTIFICIAL Y SISTEMA:{C_RESET}")
-    print(f"  * {C_WHITE}/ia{C_RESET} [ollama|gemini]       : Alterna entre IA Local Offline (Ollama) y Nube (Gemini Cloud).")
+    print(f"  * {C_WHITE}/ia{C_RESET} [motor]              : Alterna motor de IA (Gemini, OpenAI, Anthropic, AWS, Ollama).")
     print(f"  * {C_WHITE}/vigilante{C_RESET} [segundos]     : Monitoreo continuo en segundo plano con notificaciones nativas de SO.")
-    print(f"  * {C_WHITE}/set-key{C_RESET}                  : Configura o actualiza tu Gemini API Key de forma segura.")
+    print(f"  * {C_WHITE}/set-key{C_RESET}                  : Configura API Key de tu proveedor de IA con enlace directo en el navegador.")
     print(f"  * {C_WHITE}/helpme{C_RESET} (o {C_WHITE}/ayuda{C_RESET})       : Muestra este catalogo completo de comandos.")
     print(f"  * {C_WHITE}/salir{C_RESET} (o {C_WHITE}exit{C_RESET})           : Cierra la consola de GitDoctor.\n")
     print(f"{C_GRAY}💡 Tip: Recuerda que el Motor Antierrores te permite escribir los comandos tal cual sin la barra '/' (ej: 'salud', 'sync', 'disco').{C_RESET}\n")
@@ -5165,7 +5409,7 @@ def dispatch_single_command(canon_cmd, rest, repos_dir, catalog, catalog_file, g
                             catalog_file=catalog_file, gh_info=gh_info, active_orgs=enabled_orgs)
 
     elif canon_cmd == "/set-key":
-        load_gemini_api_key(script_dir, interactive=True)
+        load_ai_api_key(script_dir, interactive=True)
 
     elif canon_cmd == "/ia":
         interactive_switch_ai(local_cfg, script_dir, target=rest if rest else None)
@@ -5245,7 +5489,8 @@ def main():
     disabled_orgs = set(local_cfg.get("disabled_orgs", []))
     enabled_orgs = [o for o in all_known_orgs if o not in disabled_orgs]
 
-    api_key = load_gemini_api_key(script_dir, interactive=False)
+    ai_provider = local_cfg.get("ai_provider", "gemini")
+    api_key = load_ai_api_key(script_dir, ai_provider, interactive=False)
 
     # Modo CLI Directo: Si se ejecuto 'gitdoctor <comando>' o 'python3 agent.py <comando>'
     if len(sys.argv) > 1:
@@ -5275,21 +5520,30 @@ def main():
     else:
         print(f"{C_YELLOW}[!] GitHub:{C_RESET} No has iniciado sesion. Escribe {C_WHITE}/login{C_RESET} para autenticarte con tu cuenta.")
 
-    # Notificacion de Motor de IA (Multi-IA: Ollama Local + Gemini Cloud)
+    # Notificacion de Motor de IA (Multi-IA: Ollama Local + Proveedores Cloud)
     ai_provider = local_cfg.get("ai_provider", "gemini")
     ollama_info = probe_ollama_status()
     if ai_provider == "ollama":
         o_model = local_cfg.get("ollama_model", "llama3.1")
         print(f"{C_GREEN}[OK] IA Activa:{C_RESET} Ollama Local Offline {C_GRAY}(Modelo: {o_model} @ localhost:11434 - 100% privado){C_RESET}")
-    elif api_key:
+    elif ai_provider == "openai" and api_key:
+        print(f"{C_GREEN}[OK] IA Activa:{C_RESET} OpenAI (ChatGPT) {C_GRAY}(Key: {get_masked_key(api_key)}){C_RESET}")
+    elif ai_provider == "anthropic" and api_key:
+        print(f"{C_GREEN}[OK] IA Activa:{C_RESET} Anthropic Claude {C_GRAY}(Key: {get_masked_key(api_key)}){C_RESET}")
+    elif ai_provider == "aws":
+        print(f"{C_GREEN}[OK] IA Activa:{C_RESET} AWS Bedrock {C_GRAY}(Key ID: {get_masked_key(api_key)}){C_RESET}")
+    elif ai_provider == "gemini" and api_key:
         print(f"{C_GREEN}[OK] IA Activa:{C_RESET} Google Gemini Cloud {C_GRAY}(Key: {get_masked_key(api_key)}){C_RESET}")
         if ollama_info["available"]:
             print(f"      {C_CYAN}[Tip Local]: Ollama detectado en tu maquina. Puedes alternar a IA local con /ia ollama.{C_RESET}")
+    elif ai_provider == "none":
+        print(f"{C_GRAY}[INFO] IA:{C_RESET} Modo clasico sin IA activo. Escribe {C_WHITE}/ia{C_RESET} o {C_WHITE}/set-key{C_RESET} para activar un motor.")
     else:
         if ollama_info["available"]:
             print(f"{C_GREEN}[OK] IA Activa:{C_RESET} Ollama Local detectado {C_GRAY}(localhost:11434). Escribe /ia ollama para activarlo.{C_RESET}")
         else:
-            print(f"{C_YELLOW}[!] IA:{C_RESET} Modo Offline {C_GRAY}(Usa /set-key para Gemini o abre Ollama para IA local offline){C_RESET}")
+            p_name = {"gemini": "Gemini", "openai": "OpenAI", "anthropic": "Anthropic", "aws": "AWS"}.get(ai_provider, ai_provider.upper())
+            print(f"{C_YELLOW}[!] IA:{C_RESET} Modo Offline {C_GRAY}(Usa /set-key para configurar clave de {p_name} o abre Ollama para IA local){C_RESET}")
 
     # Revision y descarga automatica de cambios remotos al iniciar GitDoctor
     org_filter = enabled_orgs if disabled_orgs else None
@@ -5396,8 +5650,9 @@ def main():
                         catalog = [c for c in catalog if c.get("name") not in ["gitdoctor", "repos-sync"] and not c.get("url", "").endswith("/gitdoctor.git") and not c.get("url", "").endswith("/repos-sync.git")]
                     except Exception:
                         pass
-                if canon_cmd == "/set-key":
-                    new_key = load_gemini_api_key(script_dir, interactive=False)
+                if canon_cmd in ["/set-key", "/ia"]:
+                    ai_provider = local_cfg.get("ai_provider", "gemini")
+                    new_key = load_ai_api_key(script_dir, ai_provider, interactive=False)
                     if new_key:
                         api_key = new_key
                         _CACHED_GEMINI_MODELS = []
@@ -5405,19 +5660,27 @@ def main():
 
         # Turno conversacional con IA
         ai_provider = local_cfg.get("ai_provider", "gemini")
-        if ai_provider == "gemini" and not api_key:
+        if ai_provider not in ["ollama", "none"] and not api_key:
             ollama_info = probe_ollama_status()
             if ollama_info["available"]:
-                print(f"\n{C_CYAN}[*] Gemini no tiene clave configurada, pero Ollama esta activo localmente.{C_RESET}")
+                print(f"\n{C_CYAN}[*] {ai_provider.capitalize()} no tiene clave configurada, pero Ollama esta activo localmente.{C_RESET}")
                 print(f"{C_GRAY}Cambiando automaticamente a Ollama Local Offline...{C_RESET}\n")
                 local_cfg["ai_provider"] = "ollama"
                 ai_provider = "ollama"
             else:
-                print(f"\n{C_YELLOW}[!] Para conversar en lenguaje natural con IA necesitas tu Gemini API Key o abrir Ollama.{C_RESET}")
+                p_label = {"gemini": "Gemini", "openai": "OpenAI", "anthropic": "Anthropic", "aws": "AWS"}.get(ai_provider, "tu IA")
+                print(f"\n{C_YELLOW}[!] Para conversar en lenguaje natural con IA necesitas tu clave de {p_label} o abrir Ollama.{C_RESET}")
                 print(f"{C_GRAY}Escribe {C_WHITE}/set-key{C_GRAY} para configurar tu clave segura o {C_WHITE}/ia{C_GRAY} para IA local.{C_RESET}\n")
                 continue
 
-        ai_engine_name = "Ollama Local" if ai_provider == "ollama" else "Gemini"
+        ai_names = {
+            "ollama": "Ollama Local",
+            "gemini": "Google Gemini",
+            "openai": "OpenAI ChatGPT",
+            "anthropic": "Anthropic Claude",
+            "aws": "AWS Bedrock"
+        }
+        ai_engine_name = ai_names.get(ai_provider, "GitDoctor AI")
         print(f"{C_GRAY}Consultando con {ai_engine_name}...{C_RESET}")
         conversation_history.append({
             "role": "user",

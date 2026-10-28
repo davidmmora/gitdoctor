@@ -83,13 +83,14 @@ Elige la carpeta raíz donde deseas tener tus proyectos (en cualquier unidad o r
    ```
 
 ### 🧙‍♂️ ¿Qué configura el Asistente Interactivo en el primer uso?
-1. **Nombre y Ubicación Canónica:** Define el nombre canónico `gitdoctor` y verifica la ruta de tus repositorios. Blindado contra eliminaciones accidentales.
-2. **Conexión con GitHub:** Conecta con tu cuenta mediante GitHub CLI (`gh`) y descubre automáticamente tus organizaciones y repositorios reales (no asume organizaciones fijas de otros usuarios).
-3. **Alcance de Descarga:** Te permite elegir si descargar **TODO** tu inventario, **solo ciertas organizaciones** (sincronización selectiva por equipo) o **solo catalogar** (descarga bajo demanda con `/clone`).
-4. **Identidad Git:** Configura tu nombre y correo para commits en esta máquina.
-5. **Motor de IA:** Elige entre **Ollama Local Offline** (100% privado, gratis) o **Google Gemini API** (nube ultra-rápida).
-6. **Vigilante en Segundo Plano:** Activa o desactiva las notificaciones de escritorio continuas.
-7. **Integración con el Sistema:** Configura comandos globales (`gitdoctor`, `gitdoc`, `reposync`) en tu terminal y crea los 5 accesos directos en tu Escritorio.
+1. **Detección e Instalación de Herramientas Esenciales:** Detecta si cuentas con `git` (Git CLI) y `gh` (GitHub CLI). Si no los tienes instalados, los descarga e instala automáticamente utilizando `curl` nativo y los instaladores oficiales del sistema.
+2. **Nombre y Ubicación Canónica:** Define el nombre canónico `gitdoctor` y verifica la ruta de tus repositorios. Blindado contra eliminaciones accidentales.
+3. **Conexión con GitHub:** Conecta con tu cuenta mediante GitHub CLI (`gh`) y descubre automáticamente tus organizaciones y repositorios reales (no asume organizaciones fijas de otros usuarios).
+4. **Alcance de Descarga:** Te permite elegir si descargar **TODO** tu inventario, **solo ciertas organizaciones** (sincronización selectiva por equipo) o **solo catalogar** (descarga bajo demanda con `/clone`).
+5. **Identidad Git:** Configura tu nombre y correo para commits en esta máquina.
+6. **Motor de IA Multi-Proveedor:** Permite elegir tu motor preferido (**Google Cloud / Gemini**, **OpenAI ChatGPT**, **Anthropic Claude**, **AWS Bedrock** u **Ollama Local Offline**). Abre automáticamente la ubicación exacta de la API key en tu navegador y guarda tus credenciales protegidas en `.env`.
+7. **Vigilante en Segundo Plano:** Activa o desactiva las notificaciones de escritorio continuas.
+8. **Integración con el Sistema:** Configura comandos globales (`gitdoctor`, `gitdoc`, `reposync`) en tu terminal y crea los 5 accesos directos en tu Escritorio.
 
 ---
 
@@ -167,9 +168,16 @@ Analiza carpetas pesadas regenerables (`node_modules`, `.next`, `dist`, `build`,
 ### 8. 🛫 Pre-Flight Check de Salida Segura (`apagar`)
 Antes de apagar el equipo o cambiar de máquina, escribe `apagar`. Audita que todo esté en orden y te ofrece subir los commits pendientes a GitHub para que puedas cerrar sesión con 100% de tranquilidad.
 
-### 9. 🤖 Chat Conversacional con Gemini AI (Copiloto Protector)
-Si tienes configurada tu `GEMINI_API_KEY` (configúrala fácilmente escribiendo `/set-key`), puedes hablar con el guardián en lenguaje natural (incluso con modismos, abreviaturas o faltas de ortografía):
-* **Auto-Descubrimiento Dinámico de Modelos:** Consulta en tiempo real los modelos disponibles en la API de Google (priorizando `gemini-3.8-flash`, `gemini-3.5-flash`, etc.) adaptándose automáticamente a cambios de versión o lanzamientos futuros de Google sin romperse.
+### 9. 🤖 Chat Conversacional Multi-IA (Copiloto Protector)
+GitDoctor soporta múltiples proveedores de Inteligencia Artificial para adaptarse a tu flujo de trabajo:
+* **Google Gemini / Google Cloud:** Cuota gratuita de alta velocidad con auto-descubrimiento dinámico de modelos (`gemini-2.5-flash`, etc.).
+* **OpenAI (ChatGPT):** Modelos GPT-4o, GPT-4 y o1.
+* **Anthropic Claude:** Modelos Claude 3.5 Sonnet y Claude 3.5 Haiku.
+* **AWS Bedrock / Amazon Web Services:** Modelos empresariales dentro de tu infraestructura AWS.
+* **Ollama Local Offline:** 100% privado en tu equipo, sin enviar datos a la nube, sin API key y sin costos.
+
+Escribe `/set-key` para configurar la API key de tu proveedor preferido: GitDoctor te mostrará la ubicación exacta y abrirá automáticamente la página oficial en tu navegador para que generes y copies tu clave al instante. Puedes cambiar de motor en cualquier momento con `/ia`.
+
 * **Function Calling Bidireccional:** La IA no solo responde dudas, sino que ejecuta acciones reales en tu computadora (`check_health`, `clean_hygiene`, `open_in_vscode`, `clone_repo_or_org`, etc.) y te explica el resultado en español claro.
 * **Ejemplos de interacción:**
   * *"¿Cómo está la salud de mis proyectos?"*
@@ -201,6 +209,7 @@ Todos los comandos se pueden escribir con barra (`/comando`) o sin barra (`coman
 | **`/disco`** | `disco`, `prune`, `espacio` | Analiza y purga carpetas pesadas (`node_modules`, etc.) | `disco` |
 | **`/apagar`** | `apagar`, `checkout`, `salida` | Auditoría de salida segura antes de apagar o salir | `apagar` |
 | **`/vigilante`** | `vigilante`, `watchdog` | Monitoreo en bucle con notificaciones nativas | `vigilante 300` |
+| **`/ia`** | `ia`, `ai`, `motor` | Alterna entre Google Gemini, OpenAI, Claude, AWS y Ollama | `/ia openai` o `/ia ollama` |
 | **`/github`** | `github`, `gh`, `perfil` | Ver usuario activo, cuentas guardadas y organizaciones | `github` |
 | **`/login`** | `login`, `auth` | Inicia sesión con cualquier cuenta de GitHub | `login` |
 | **`/switch`** | `switch`, `cambiar-cuenta` | Cambia entre cuentas de GitHub guardadas en el equipo | `switch` |
@@ -209,7 +218,7 @@ Todos los comandos se pueden escribir con barra (`/comando`) o sin barra (`coman
 | **`/dir`** | `dir`, `carpeta` | Ver o cambiar la carpeta raíz de repositorios | `dir D:\MisProyectos` |
 | **`/catalogo`**| `catalogo`, `boveda`, `vault` | Sincroniza tu catálogo privado vía GitHub Gist Secreto | `/catalogo push` o `/catalogo pull` |
 | **`/importar-github`**| `mis-repos`, `descubrir` | Descarga todos tus repos de GitHub a tu catálogo personal | `mis-repos` |
-| **`/set-key`** | `set-key`, `key` | Configura tu API Key privada de Gemini AI | `set-key` |
+| **`/set-key`** | `set-key`, `key` | Configura tu API Key guiada con apertura directa en navegador | `set-key` |
 | **`/ayuda`** | `ayuda`, `help` | Muestra la guía interactiva en consola | `ayuda` |
 | **`/salir`** | `salir`, `exit`, `quit` | Cierra el asistente | `salir` |
 
@@ -217,10 +226,10 @@ Todos los comandos se pueden escribir con barra (`/comando`) o sin barra (`coman
 
 ## 🔒 Seguridad y Privacidad Garantizadas
 
-* **Claves Privadas Protegidas:** Tu `GEMINI_API_KEY` se guarda de forma local y privada en `.env`. Este archivo está estrictamente ignorado por Git en `.gitignore`.
+* **Claves Privadas Protegidas:** Tus claves de API (`GEMINI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `AWS_ACCESS_KEY_ID`, etc.) se guardan de forma local y privada en `.env`. Este archivo está estrictamente ignorado por Git en `.gitignore` y protegido con permisos 0600.
 * **Configuración por Máquina Aislada:** `config.local.json` y `repos.local.json` están excluidos de Git para que cada máquina conserve sus propias carpetas, organizaciones y proyectos sin generar conflictos entre desarrolladores.
-* **Cero Fugas:** En pantalla las claves siempre se ofuscan (`AIza...****`) y los mensajes de error limpian cualquier token antes de imprimirse.
-* **Modo Offline:** Si no tienes API Key de Gemini o estás sin internet, todo el sistema opera al 100% en modo local con los comandos rápidos.
+* **Cero Fugas:** En pantalla las claves siempre se ofuscan (`sk-ant...****`, `AIza...****`) y los mensajes de error limpian cualquier token antes de imprimirse.
+* **Modo Offline:** Si no tienes API Key o estás sin internet, puedes usar Ollama Local Offline o el modo clásico local al 100% con los comandos rápidos.
 
 ---
 

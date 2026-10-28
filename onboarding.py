@@ -16,6 +16,10 @@ import sys
 import json
 import shutil
 import subprocess
+import tempfile
+import platform
+import webbrowser
+import urllib.request
 
 # Configurar encoding UTF-8 seguro
 if hasattr(sys.stdout, 'reconfigure'):
@@ -127,10 +131,573 @@ def ask_user_confirmation(prompt, default_yes=True):
     return ans in ["s", "si", "y", "yes"]
 
 # ==============================================================================
+# GESTION Y VERIFICACION DE HERRAMIENTAS ESENCIALES (GIT, GH, CURL)
+# ==============================================================================
+def _refresh_path_and_find_tools():
+    """Recarga el PATH en el proceso actual incluyendo rutas estandar donde residen herramientas"""
+    cur_parts = os.environ.get("PATH", "").split(os.pathsep)
+    extra_dirs = []
+
+    if sys.platform == "win32":
+        local_app = os.environ.get("LOCALAPPDATA", "")
+        extra_dirs = [
+            r"C:\Program Files\Git\cmd",
+            r"C:\Program Files\Git\bin",
+            r"C:\Program Files\GitHub CLI",
+            os.path.join(local_app, "GitHub CLI") if local_app else "",
+        ]
+        # Leer tambien PATH del Registro de Windows
+        try:
+            import winreg
+            for hkey, subkey in [(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"),
+                                 (winreg.HKEY_CURRENT_USER, r"Environment")]:
+                try:
+                    with winreg.OpenKey(hkey, subkey) as k:
+                        val, _ = winreg.QueryValueEx(k, "Path")
+                        extra_dirs.extend(val.split(";"))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    else:
+        home = os.path.expanduser("~")
+        extra_dirs = [
+            "/usr/local/bin",
+            "/opt/homebrew/bin",
+            os.path.join(home, ".local", "bin"),
+            os.path.join(home, "bin")
+        ]
+
+    new_dirs = [d for d in extra_dirs if d and os.path.isdir(d) and d not in cur_parts]
+    if new_dirs:
+        os.environ["PATH"] = os.pathsep.join(new_dirs + cur_parts)
+
+def install_git_cli():
+    """Descarga e instala Git CLI si no esta presente en el sistema"""
+    print(f"\n{C_CYAN}[*] Iniciando instalacion de Git CLI...{C_RESET}")
+    system = sys.platform
+
+    if system == "darwin":
+        if shutil.which("brew"):
+            print(f"  {C_GRAY}Homebrew detectado. Instalando Git: brew install git...{C_RESET}")
+            subprocess.run(["brew", "install", "git"], check=False)
+            _refresh_path_and_find_tools()
+            return shutil.which("git") is not None
+        else:
+            print(f"  {C_YELLOW}Invocando instalador oficial de herramientas de desarrollador de Apple...{C_RESET}")
+            subprocess.run(["xcode-select", "--install"], check=False)
+            print(f"  {C_GRAY}Sigue las instrucciones del dialogo emergente para completar la instalacion de Git.{C_RESET}")
+            return True
+
+    elif system == "win32":
+        if shutil.which("winget"):
+            print(f"  {C_GRAY}Winget detectado. Instalando Git: winget install Git.Git...{C_RESET}")
+            subprocess.run(["winget", "install", "--id", "Git.Git", "-e", "--source", "winget", "--accept-source-agreements", "--accept-package-agreements"], check=False)
+            _refresh_path_and_find_tools()
+            if shutil.which("git"):
+                print(f"  {C_GREEN}[OK] Git CLI instalado con exito via winget.{C_RESET}")
+                return True
+
+        # Descarga con curl nativo
+        print(f"  {C_GRAY}Descargando instalador de Git for Windows con curl nativo...{C_RESET}")
+        git_installer = os.path.join(tempfile.gettempdir(), "Git-Installer.exe")
+        git_url = "https://github.com/git-for-windows/git/releases/latest/download/Git-64-bit.exe"
+        dl = subprocess.run(["curl.exe", "-fSL", "-o", git_installer, git_url], check=False)
+        if dl.returncode == 0 and os.path.isfile(git_installer):
+            print(f"  {C_GRAY}Ejecutando instalacion silenciosa de Git...{C_RESET}")
+            subprocess.run([git_installer, "/VERYSILENT", "/NORESTART", "/NOCANCEL", "/SP-", "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS"], check=False)
+            try:
+                os.remove(git_installer)
+            except Exception:
+                pass
+            _refresh_path_and_find_tools()
+            if shutil.which("git"):
+                print(f"  {C_GREEN}[OK] Git CLI instalado exitosamente.{C_RESET}")
+                return True
+
+    else:
+        # Linux
+        print(f"  {C_GRAY}Intentando instalar Git mediante el gestor del sistema...{C_RESET}")
+        for mgr_cmd in [["sudo", "apt-get", "update"], ["sudo", "apt-get", "install", "-y", "git"]]:
+            subprocess.run(mgr_cmd, check=False)
+        _refresh_path_and_find_tools()
+        return shutil.which("git") is not None
+
+    return shutil.which("git") is not None
+
+def install_github_cli():
+    """Descarga e instala GitHub CLI ('gh') mediante curl nativo o gestor de paquetes"""
+    print(f"\n{C_CYAN}[*] Iniciando instalacion de GitHub CLI ('gh')...{C_RESET}")
+    system = sys.platform
+
+    # 1. En macOS
+    if system == "darwin":
+        if shutil.which("brew"):
+            print(f"  {C_GRAY}Homebrew detectado. Ejecutando: brew install gh...{C_RESET}")
+            res = subprocess.run(["brew", "install", "gh"], check=False)
+            _refresh_path_and_find_tools()
+            if res.returncode == 0 and shutil.which("gh"):
+                print(f"  {C_GREEN}[OK] GitHub CLI instalado con exito via Homebrew.{C_RESET}")
+                return True
+
+        # Instalacion directa con curl
+        print(f"  {C_GRAY}Descargando GitHub CLI oficial con curl nativo...{C_RESET}")
+        arch = platform.machine().lower()
+        gh_arch = "macOS_arm64" if arch in ["arm64", "aarch64"] else "macOS_amd64"
+
+        version = "2.67.0"
+        try:
+            res_v = subprocess.run(
+                ["curl", "-sSL", "-o", "/dev/null", "-w", "%{url_effective}", "https://github.com/cli/cli/releases/latest"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10, check=False
+            )
+            out_url = res_v.stdout.decode('utf-8').strip()
+            if "/tag/v" in out_url:
+                version = out_url.split("/tag/v")[-1].strip()
+        except Exception:
+            pass
+
+        url = f"https://github.com/cli/cli/releases/download/v{version}/gh_{version}_{gh_arch}.zip"
+        tmp_dir = tempfile.mkdtemp(prefix="gitdoctor_gh_")
+        zip_path = os.path.join(tmp_dir, "gh.zip")
+
+        try:
+            print(f"  {C_GRAY}Descargando {url}...{C_RESET}")
+            dl_res = subprocess.run(["curl", "-fsSL", "-o", zip_path, url], check=False)
+            if dl_res.returncode == 0 and os.path.isfile(zip_path):
+                import zipfile
+                with zipfile.ZipFile(zip_path, 'r') as zf:
+                    zf.extractall(tmp_dir)
+
+                gh_bin = None
+                for root, dirs, files in os.walk(tmp_dir):
+                    if "gh" in files:
+                        p = os.path.join(root, "gh")
+                        if os.path.isfile(p):
+                            gh_bin = p
+                            break
+
+                if gh_bin:
+                    target_dir = "/usr/local/bin"
+                    if not os.access(target_dir, os.W_OK):
+                        target_dir = os.path.expanduser("~/.local/bin")
+                        os.makedirs(target_dir, exist_ok=True)
+
+                    dest_file = os.path.join(target_dir, "gh")
+                    shutil.copy2(gh_bin, dest_file)
+                    os.chmod(dest_file, 0o755)
+
+                    _refresh_path_and_find_tools()
+                    print(f"  {C_GREEN}[OK] GitHub CLI ('gh') instalado exitosamente en {dest_file}.{C_RESET}")
+                    return True
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    # 2. En Windows
+    elif system == "win32":
+        if shutil.which("winget"):
+            print(f"  {C_GRAY}Winget detectado. Ejecutando: winget install GitHub.cli...{C_RESET}")
+            res = subprocess.run(["winget", "install", "--id", "GitHub.cli", "-e", "--accept-source-agreements", "--accept-package-agreements"], check=False)
+            _refresh_path_and_find_tools()
+            if shutil.which("gh"):
+                print(f"  {C_GREEN}[OK] GitHub CLI instalado con exito via winget.{C_RESET}")
+                return True
+
+        print(f"  {C_GRAY}Descargando GitHub CLI con curl nativo...{C_RESET}")
+        version = "2.67.0"
+        try:
+            res_v = subprocess.run(
+                ["curl.exe", "-sSL", "-o", "NUL", "-w", "%{url_effective}", "https://github.com/cli/cli/releases/latest"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10, check=False
+            )
+            out_url = res_v.stdout.decode('utf-8').strip()
+            if "/tag/v" in out_url:
+                version = out_url.split("/tag/v")[-1].strip()
+        except Exception:
+            pass
+
+        msi_url = f"https://github.com/cli/cli/releases/download/v{version}/gh_{version}_windows_amd64.msi"
+        tmp_msi = os.path.join(tempfile.gettempdir(), f"gh_{version}.msi")
+
+        print(f"  {C_GRAY}Descargando {msi_url}...{C_RESET}")
+        dl_res = subprocess.run(["curl.exe", "-fsSL", "-o", tmp_msi, msi_url], check=False)
+        if dl_res.returncode == 0 and os.path.isfile(tmp_msi):
+            print(f"  {C_GRAY}Instalando paquete MSI de GitHub CLI...{C_RESET}")
+            subprocess.run(["msiexec.exe", "/i", tmp_msi, "/quiet", "/norestart"], check=False)
+            try:
+                os.remove(tmp_msi)
+            except Exception:
+                pass
+            _refresh_path_and_find_tools()
+            if shutil.which("gh"):
+                print(f"  {C_GREEN}[OK] GitHub CLI instalado exitosamente.{C_RESET}")
+                return True
+
+        # Fallback ZIP en Windows si MSI no se instalo
+        zip_url = f"https://github.com/cli/cli/releases/download/v{version}/gh_{version}_windows_amd64.zip"
+        tmp_zip = os.path.join(tempfile.gettempdir(), "gh.zip")
+        dl_zip = subprocess.run(["curl.exe", "-fsSL", "-o", tmp_zip, zip_url], check=False)
+        if dl_zip.returncode == 0 and os.path.isfile(tmp_zip):
+            import zipfile
+            extract_to = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "GitHub CLI")
+            os.makedirs(extract_to, exist_ok=True)
+            with zipfile.ZipFile(tmp_zip, 'r') as zf:
+                for member in zf.namelist():
+                    if member.endswith("gh.exe"):
+                        with zf.open(member) as src_file, open(os.path.join(extract_to, "gh.exe"), "wb") as dst_file:
+                            dst_file.write(src_file.read())
+                        break
+            try:
+                os.remove(tmp_zip)
+            except Exception:
+                pass
+            _refresh_path_and_find_tools()
+            if shutil.which("gh"):
+                print(f"  {C_GREEN}[OK] GitHub CLI ('gh.exe') instalado exitosamente en {extract_to}.{C_RESET}")
+                return True
+
+    # 3. En Linux
+    else:
+        print(f"  {C_GRAY}Descargando GitHub CLI con curl nativo...{C_RESET}")
+        tmp_script = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".sh") as tf:
+                tmp_script = tf.name
+            dl = subprocess.run(["curl", "-fsSL", "-o", tmp_script, "https://cli.github.com/packages/install.sh"], check=False)
+            if dl.returncode == 0 and os.path.isfile(tmp_script):
+                os.chmod(tmp_script, 0o700)
+                subprocess.run(["sudo", "bash", tmp_script], check=False)
+            _refresh_path_and_find_tools()
+            if shutil.which("gh"):
+                print(f"  {C_GREEN}[OK] GitHub CLI instalado exitosamente.{C_RESET}")
+                return True
+        except Exception:
+            pass
+        finally:
+            if tmp_script and os.path.isfile(tmp_script):
+                try:
+                    os.remove(tmp_script)
+                except Exception:
+                    pass
+
+    _refresh_path_and_find_tools()
+    return shutil.which("gh") is not None
+
+def ensure_essential_tools():
+    """
+    Verifica las herramientas esenciales (Git CLI y GitHub CLI).
+    Si faltan, utiliza curl nativo y los instaladores oficiales para instalarlas automaticamente.
+    """
+    _refresh_path_and_find_tools()
+    print(f"\n{C_CYAN}=================================================================={C_RESET}")
+    print(f"{C_WHITE}{C_BOLD}  GitDoctor -- Diagnostico de Herramientas Esenciales          {C_RESET}")
+    print(f"{C_CYAN}=================================================================={C_RESET}")
+    print(f"{C_GRAY}Verificando requisitos indispensables para clonacion, sincronizacion y GitHub:{C_RESET}\n")
+
+    # 1. Comprobar Git CLI
+    has_git = shutil.which("git") is not None
+    if has_git:
+        git_ver = run_cmd(["git", "--version"])
+        print(f"  * Git CLI:        {C_GREEN}[OK] Detectado ({git_ver}){C_RESET}")
+    else:
+        print(f"  * Git CLI:        {C_RED}[NO DETECTADO]{C_RESET} (Esencial para operar repositorios)")
+        if ask_user_confirmation("  ¿Deseas que GitDoctor instale Git CLI ahora mismo usando curl?", default_yes=True):
+            install_git_cli()
+            has_git = shutil.which("git") is not None
+            if has_git:
+                print(f"    {C_GREEN}[OK] Git CLI disponible: {run_cmd(['git', '--version'])}{C_RESET}")
+            else:
+                print(f"    {C_YELLOW}[AVISO] Git se esta instalando o requiere reiniciar la terminal.{C_RESET}")
+
+    # 2. Comprobar GitHub CLI ('gh')
+    has_gh = shutil.which("gh") is not None
+    if has_gh:
+        gh_ver = run_cmd(["gh", "--version"]).splitlines()[0] if run_cmd(["gh", "--version"]) else ""
+        print(f"  * GitHub CLI:     {C_GREEN}[OK] Detectado ({gh_ver}){C_RESET}")
+    else:
+        print(f"  * GitHub CLI:     {C_YELLOW}[NO DETECTADO]{C_RESET} (Esencial para descubrir organizaciones y clonar)")
+        if ask_user_confirmation("  ¿Deseas que GitDoctor instale GitHub CLI ('gh') usando curl nativo?", default_yes=True):
+            install_github_cli()
+            has_gh = shutil.which("gh") is not None
+            if has_gh:
+                print(f"    {C_GREEN}[OK] GitHub CLI disponible: {run_cmd(['gh', '--version']).splitlines()[0]}{C_RESET}")
+            else:
+                print(f"    {C_YELLOW}[AVISO] GitHub CLI descargado. Si no responde inmediatamente, estara activo al reiniciar.{C_RESET}")
+
+    # 3. Comprobar cURL
+    has_curl = shutil.which("curl") is not None or shutil.which("curl.exe") is not None
+    if has_curl:
+        print(f"  * cURL Nativo:    {C_GREEN}[OK] Detectado{C_RESET}")
+    else:
+        print(f"  * cURL Nativo:    {C_GRAY}[INFO] Se utilizaran bibliotecas integradas de red{C_RESET}")
+
+    print("")
+    return {"git": has_git, "gh": has_gh}
+
+# ==============================================================================
+# GESTION SEGURA DE VARIABLES DE ENTORNO Y CLAVES PRIVADAS (.env)
+# ==============================================================================
+def ensure_env_in_gitignore(script_dir):
+    """Garantiza que .env y archivos locales de configuracion esten en .gitignore"""
+    gi_path = os.path.join(script_dir, ".gitignore")
+    lines = []
+    if os.path.isfile(gi_path):
+        try:
+            with open(gi_path, "r", encoding="utf-8") as f:
+                lines = [l.strip() for l in f.readlines()]
+        except Exception:
+            pass
+
+    needed = [".env", "*.env", "config.local.json", "*.local.json", "repos.local.json"]
+    to_add = [n for n in needed if n not in lines]
+    if to_add:
+        try:
+            with open(gi_path, "a", encoding="utf-8") as f:
+                f.write("\n# Archivos locales de configuracion y claves privadas\n")
+                for n in to_add:
+                    f.write(f"{n}\n")
+        except Exception:
+            pass
+
+def save_env_var(script_dir, var_name, value):
+    """Guarda o actualiza una variable en .env de forma segura y restringe permisos a 0600"""
+    ensure_env_in_gitignore(script_dir)
+    env_path = os.path.join(script_dir, ".env")
+    existing_lines = []
+    if os.path.isfile(env_path):
+        try:
+            with open(env_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip().startswith(f"{var_name}="):
+                        existing_lines.append(line)
+        except Exception:
+            pass
+
+    existing_lines.append(f"{var_name}={value.strip()}\n")
+    try:
+        with open(env_path, "w", encoding="utf-8") as f:
+            f.writelines(existing_lines)
+        if hasattr(os, 'chmod') and os.name != 'nt':
+            try:
+                os.chmod(env_path, 0o600)
+            except Exception:
+                pass
+        return True
+    except Exception as e:
+        print(f"  {C_RED}[ERROR] No se pudo guardar {var_name}: {e}{C_RESET}")
+        return False
+
+# ==============================================================================
+# CONFIGURACION MULTI-PROVEEDOR DE INTELIGENCIA ARTIFICIAL (GITDOCTOR AI)
+# ==============================================================================
+def configure_ai_provider(script_dir, current_cfg=None):
+    """
+    Configurador interactivo de motor de IA.
+    Pregunta que proveedor desea el usuario:
+      - Google Gemini / Google Cloud
+      - OpenAI (ChatGPT)
+      - Anthropic (Claude)
+      - AWS Bedrock / Amazon Web Services
+      - Ollama (Local Offline)
+      - Omitir
+    Envia al usuario a la ubicacion exacta para obtener su API key (abriendo su navegador),
+    explica los pasos detallados y almacena la clave en .env de forma segura.
+    """
+    if current_cfg is None:
+        current_cfg = {}
+
+    current_provider = current_cfg.get("ai_provider", "gemini")
+
+    print(f"\n{C_CYAN}=================================================================={C_RESET}")
+    print(f"{C_WHITE}{C_BOLD}  GitDoctor AI -- Seleccion de Motor de Inteligencia Artificial  {C_RESET}")
+    print(f"{C_CYAN}=================================================================={C_RESET}")
+    print(f"{C_GRAY}GitDoctor incluye un copiloto clinico para diagnostico, salud de repositorios,{C_RESET}")
+    print(f"{C_GRAY}resolucion de dudas y seguridad. Puedes usar la nube o un modelo local:{C_RESET}\n")
+
+    options = [
+        ("1", "gemini", "Google Gemini / Google Cloud", "Recomendado, cuota gratuita, alta velocidad", "https://aistudio.google.com/app/apikey"),
+        ("2", "openai", "OpenAI / ChatGPT", "Modelos GPT-4o, GPT-4, o1", "https://platform.openai.com/api-keys"),
+        ("3", "anthropic", "Anthropic Claude", "Claude 3.5 Sonnet, Claude 3.5 Haiku", "https://console.anthropic.com/settings/keys"),
+        ("4", "aws", "AWS Bedrock / Amazon Web Services", "Modelos en tu infraestructura AWS (Claude, Titan)", "https://console.aws.amazon.com/iam/home#/security_credentials"),
+        ("5", "ollama", "Ollama Local Offline", "100% privado en tu equipo, sin API key, gratuito", "https://ollama.com/download"),
+        ("6", "none", "Omitir por ahora", "Modo clasico sin asistente de IA", None)
+    ]
+
+    for num, pid, name, note, _ in options:
+        marker = f" {C_GREEN}(Activo){C_RESET}" if pid == current_provider else ""
+        print(f"  {C_WHITE}[{num}]{C_RESET} {C_BOLD}{name}{C_RESET}{marker}")
+        print(f"      {C_GRAY}{note}{C_RESET}")
+
+    default_choice = "1"
+    for num, pid, _, _, _ in options:
+        if pid == current_provider:
+            default_choice = num
+            break
+
+    try:
+        choice = input(f"\n  {C_BOLD}Selecciona tu proveedor de IA [1-6] (Enter para [{default_choice}]): {C_RESET}").strip()
+    except (EOFError, KeyboardInterrupt):
+        choice = default_choice
+
+    if not choice:
+        choice = default_choice
+
+    selected_opt = next((opt for opt in options if opt[0] == choice), options[0])
+    _, provider_id, provider_name, _, url = selected_opt
+
+    env_file = os.path.join(script_dir, ".env")
+    result_cfg = dict(current_cfg)
+    result_cfg["ai_provider"] = provider_id
+
+    # 1. Omitir por ahora
+    if provider_id == "none":
+        print(f"\n  {C_GRAY}[*] Modo clasico activado. GitDoctor operara con comandos tradicionales sin IA.{C_RESET}")
+        return result_cfg
+
+    # 2. Ollama Local Offline
+    if provider_id == "ollama":
+        print(f"\n  {C_GREEN}--- Ollama Local Offline Seleccionado ---{C_RESET}")
+        print(f"  {C_GRAY}Ollama ejecuta modelos de lenguaje en tu propio procesador/GPU local.{C_RESET}")
+        print(f"  {C_GRAY}100% privado: tus datos nunca salen de tu ordenador y no requiere API key.{C_RESET}")
+
+        is_active = False
+        try:
+            req = urllib.request.Request("http://localhost:11434/api/tags", method="GET")
+            with urllib.request.urlopen(req, timeout=1.0) as resp:
+                data = json.loads(resp.read().decode('utf-8'))
+                models = [m.get("name") for m in data.get("models", [])]
+                is_active = True
+                print(f"  {C_GREEN}[OK] Ollama esta activo en localhost:11434.{C_RESET}")
+                if models:
+                    print(f"  {C_CYAN}Modelos locales detectados:{C_RESET} {', '.join(models[:4])}")
+                    result_cfg["ollama_model"] = models[0]
+                else:
+                    print(f"  {C_YELLOW}[INFO] Ollama esta corriendo pero aun no tiene modelos descargados.{C_RESET}")
+                    print(f"  {C_GRAY}Puedes descargar uno con: ollama run llama3.1{C_RESET}")
+                    result_cfg["ollama_model"] = "llama3.1"
+        except Exception:
+            pass
+
+        if not is_active:
+            if shutil.which("ollama"):
+                print(f"  {C_GREEN}[OK] Comando 'ollama' detectado en tu PATH.{C_RESET}")
+                print(f"  {C_GRAY}Recuerda iniciarlo con 'ollama serve' o 'ollama run llama3.1'.{C_RESET}")
+            else:
+                print(f"\n  {C_YELLOW}[!] Ollama no esta instalado o no se encuentra en ejecucion.{C_RESET}")
+                print(f"  Ubicacion oficial de descarga: {C_WHITE}https://ollama.com/download{C_RESET}")
+                if ask_user_confirmation("  ¿Deseas abrir la pagina de descarga de Ollama en tu navegador?", default_yes=True):
+                    try:
+                        webbrowser.open("https://ollama.com/download")
+                        print(f"  {C_GREEN}[OK] Abriendo navegador...{C_RESET}")
+                    except Exception:
+                        pass
+                print(f"  {C_GRAY}Despues de instalarlo, ejecuta 'ollama run llama3.1' para comenzar.{C_RESET}")
+            result_cfg["ollama_model"] = result_cfg.get("ollama_model", "llama3.1")
+        return result_cfg
+
+    # 3. Proveedores Cloud que requieren credenciales / API Key
+    print(f"\n  {C_CYAN}------------------------------------------------------------{C_RESET}")
+    print(f"  {C_BOLD}Configuracion de {provider_name}{C_RESET}")
+    print(f"  {C_CYAN}------------------------------------------------------------{C_RESET}")
+
+    if provider_id == "gemini":
+        var_name = "GEMINI_API_KEY"
+        print(f"  {C_WHITE}Ubicacion exacta para obtener tu clave gratuita:{C_RESET}")
+        print(f"  {C_CYAN}-> Google AI Studio:      {C_WHITE}https://aistudio.google.com/app/apikey{C_RESET}")
+        print(f"  {C_GRAY}-> Google Cloud Console:  https://console.cloud.google.com/apis/credentials{C_RESET}")
+        print(f"\n  {C_GRAY}Pasos:{C_RESET}")
+        print(f"    1. Inicia sesion con tu cuenta de Google.")
+        print(f"    2. Haz clic en 'Create API key' o 'Get API key'.")
+        print(f"    3. Copia tu clave (comienza con 'AIzaSy...') y pegala abajo.")
+
+    elif provider_id == "openai":
+        var_name = "OPENAI_API_KEY"
+        print(f"  {C_WHITE}Ubicacion exacta para obtener tu clave de OpenAI:{C_RESET}")
+        print(f"  {C_CYAN}-> OpenAI Platform:       {C_WHITE}https://platform.openai.com/api-keys{C_RESET}")
+        print(f"\n  {C_GRAY}Pasos:{C_RESET}")
+        print(f"    1. Inicia sesion en OpenAI Platform.")
+        print(f"    2. Haz clic en '+ Create new secret key'.")
+        print(f"    3. Asigna un nombre (ej. 'GitDoctor') y copia tu clave (comienza con 'sk-...').")
+
+    elif provider_id == "anthropic":
+        var_name = "ANTHROPIC_API_KEY"
+        print(f"  {C_WHITE}Ubicacion exacta para obtener tu clave de Anthropic:{C_RESET}")
+        print(f"  {C_CYAN}-> Anthropic Console:     {C_WHITE}https://console.anthropic.com/settings/keys{C_RESET}")
+        print(f"\n  {C_GRAY}Pasos:{C_RESET}")
+        print(f"    1. Inicia sesion en Anthropic Console.")
+        print(f"    2. Ve a Settings -> API Keys y haz clic en 'Create Key'.")
+        print(f"    3. Copia tu clave (comienza con 'sk-ant-...') y pegala abajo.")
+
+    elif provider_id == "aws":
+        var_name = "AWS_ACCESS_KEY_ID"
+        print(f"  {C_WHITE}Ubicaciones exactas en la consola de AWS:{C_RESET}")
+        print(f"  {C_CYAN}-> AWS IAM Credenciales:  {C_WHITE}https://console.aws.amazon.com/iam/home#/security_credentials{C_RESET}")
+        print(f"  {C_GRAY}-> Amazon Bedrock Access: https://console.aws.amazon.com/bedrock/home#/modelaccess{C_RESET}")
+        print(f"\n  {C_GRAY}Pasos:{C_RESET}")
+        print(f"    1. En AWS IAM crea un Access Key ID y Secret Access Key con permisos para Bedrock.")
+        print(f"    2. En Amazon Bedrock -> Model access activa modelos (ej. Claude 3.5 Sonnet).")
+
+    # Preguntar si desea abrir la pagina en su navegador
+    if url:
+        if ask_user_confirmation(f"\n  ¿Deseas abrir la ubicacion exacta en tu navegador ahora mismo?", default_yes=True):
+            try:
+                webbrowser.open(url)
+                print(f"  {C_GREEN}[OK] Abriendo {url} en tu navegador web...{C_RESET}")
+            except Exception as e:
+                print(f"  {C_YELLOW}[!] Abre manualmente el enlace: {url}{C_RESET}")
+
+    # Comprobar si ya existe una clave en .env o entorno
+    existing_val = os.environ.get(var_name, "").strip()
+    if not existing_val and os.path.isfile(env_file):
+        try:
+            with open(env_file, "r", encoding="utf-8") as ef:
+                for line in ef:
+                    if line.strip().startswith(f"{var_name}="):
+                        existing_val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                        break
+        except Exception:
+            pass
+
+    if existing_val:
+        masked = existing_val[:4] + "..." + existing_val[-4:] if len(existing_val) > 8 else "***"
+        print(f"\n  Clave actual detectada para {var_name}: {C_CYAN}{masked}{C_RESET}")
+        if ask_user_confirmation("  ¿Deseas mantener esta clave?", default_yes=True):
+            print(f"  {C_GREEN}[OK] Clave conservada.{C_RESET}")
+            return result_cfg
+
+    # Solicitar la clave al usuario
+    print("")
+    if provider_id == "aws":
+        try:
+            aws_id = input(f"  Ingresa tu AWS_ACCESS_KEY_ID (Enter para configurar luego): ").strip()
+            aws_secret = input(f"  Ingresa tu AWS_SECRET_ACCESS_KEY (Enter para omitir): ").strip()
+            aws_region = input(f"  Ingresa tu Region de AWS [us-east-1]: ").strip() or "us-east-1"
+            if aws_id:
+                save_env_var(script_dir, "AWS_ACCESS_KEY_ID", aws_id)
+                if aws_secret:
+                    save_env_var(script_dir, "AWS_SECRET_ACCESS_KEY", aws_secret)
+                save_env_var(script_dir, "AWS_REGION", aws_region)
+                result_cfg["aws_region"] = aws_region
+                print(f"  {C_GREEN}[OK] Credenciales de AWS guardadas de forma segura en .env (ignorado por Git).{C_RESET}")
+        except (EOFError, KeyboardInterrupt):
+            pass
+    else:
+        try:
+            k_input = input(f"  Ingresa tu {provider_name} API Key (Enter para configurar luego): ").strip()
+            if k_input:
+                save_env_var(script_dir, var_name, k_input)
+                print(f"  {C_GREEN}[OK] Clave guardada de forma segura en .env (ignorado por Git con permisos 0600).{C_RESET}")
+        except (EOFError, KeyboardInterrupt):
+            pass
+
+    return result_cfg
+
+# ==============================================================================
 # DESCUBRIMIENTO DE GITHUB Y ORGANIZACIONES REALES DEL USUARIO
 # ==============================================================================
 def get_github_auth_info():
     """Obtiene datos de la sesion autenticada de GitHub CLI y sus organizaciones reales"""
+    _refresh_path_and_find_tools()
     info = {
         "installed": False,
         "logged_in": False,
@@ -428,9 +995,15 @@ def run_full_setup(script_dir):
     print(f"{C_GRAY}tu entorno de trabajo, conectara con GitHub y definira que descargar.{C_RESET}\n")
 
     # --------------------------------------------------------------------------
-    # PASO 1: CARPETA Y NOMBRE CANONICO DE GITDOCTOR
+    # PASO 1: DIAGNOSTICO DE HERRAMIENTAS ESENCIALES (GIT CLI, GH CLI, CURL)
     # --------------------------------------------------------------------------
-    print(f"{C_BOLD}[Paso 1/6] Carpeta y Ubicacion de GitDoctor{C_RESET}")
+    print(f"{C_BOLD}[Paso 1/7] Herramientas Esenciales de Desarrollo{C_RESET}")
+    tools_status = ensure_essential_tools()
+
+    # --------------------------------------------------------------------------
+    # PASO 2: CARPETA Y NOMBRE CANONICO DE GITDOCTOR
+    # --------------------------------------------------------------------------
+    print(f"{C_BOLD}[Paso 2/7] Carpeta y Ubicacion de GitDoctor{C_RESET}")
     current_folder_name = os.path.basename(script_dir)
 
     # Regla de nombre canonico: gitdoctor
@@ -489,9 +1062,9 @@ def run_full_setup(script_dir):
     print(f"  {C_GREEN}[OK] Carpeta de proyectos establecida en: {repos_dir}{C_RESET}\n")
 
     # --------------------------------------------------------------------------
-    # PASO 2: CONEXION CON GITHUB Y DETECCION DE CUENTA Y ORGANIZACIONES
+    # PASO 3: CONEXION CON GITHUB Y DETECCION DE CUENTA Y ORGANIZACIONES
     # --------------------------------------------------------------------------
-    print(f"{C_BOLD}[Paso 2/6] Conexion con GitHub y Deteccion de Organizaciones{C_RESET}")
+    print(f"{C_BOLD}[Paso 3/7] Conexion con GitHub y Deteccion de Organizaciones{C_RESET}")
     gh_info = get_github_auth_info()
 
     if not gh_info["installed"]:
@@ -535,9 +1108,9 @@ def run_full_setup(script_dir):
     print("")
 
     # --------------------------------------------------------------------------
-    # PASO 3: ALCANCE DE INSTALACION Y DESCARGA (TODO vs SELECTIVO)
+    # PASO 4: ALCANCE DE INSTALACION Y DESCARGA (TODO vs SELECTIVO)
     # --------------------------------------------------------------------------
-    print(f"{C_BOLD}[Paso 3/6] Alcance de Descarga y Organizaciones{C_RESET}")
+    print(f"{C_BOLD}[Paso 4/7] Alcance de Descarga y Organizaciones{C_RESET}")
     print(f"  Define como deseas configurar la descarga de tus repositorios:")
     print(f"  {C_WHITE}[1]{C_RESET} {C_GREEN}Descargar TODO{C_RESET} (Todos los repos de tu cuenta personal y organizaciones)")
     print(f"  {C_WHITE}[2]{C_RESET} {C_CYAN}Seleccionar Organizaciones Especificas{C_RESET} (Elegir cuales activar en este equipo)")
@@ -616,9 +1189,9 @@ def run_full_setup(script_dir):
     print("")
 
     # --------------------------------------------------------------------------
-    # PASO 4: IDENTIDAD GIT PARA ESTE EQUIPO
+    # PASO 5: IDENTIDAD GIT PARA ESTE EQUIPO
     # --------------------------------------------------------------------------
-    print(f"{C_BOLD}[Paso 4/6] Identidad de Git (Commits y Firma){C_RESET}")
+    print(f"{C_BOLD}[Paso 5/7] Identidad de Git (Commits y Firma){C_RESET}")
     cur_git_name = run_cmd(["git", "config", "--global", "user.name"])
     cur_git_email = run_cmd(["git", "config", "--global", "user.email"])
 
@@ -648,57 +1221,18 @@ def run_full_setup(script_dir):
     print("")
 
     # --------------------------------------------------------------------------
-    # PASO 5: MOTOR DE INTELIGENCIA ARTIFICIAL (GITDOCTOR AI)
+    # PASO 6: MOTOR DE INTELIGENCIA ARTIFICIAL (GITDOCTOR AI)
     # --------------------------------------------------------------------------
-    print(f"{C_BOLD}[Paso 5/6] Motor de Inteligencia Artificial (GitDoctor AI){C_RESET}")
-    print(f"  GitDoctor incluye un asistente clinico inteligente para diagnostico y salud Git:")
-    print(f"  {C_WHITE}[1]{C_RESET} {C_GREEN}Ollama Local Offline{C_RESET} (100% privado, sin API key, gratuito)")
-    print(f"  {C_WHITE}[2]{C_RESET} {C_CYAN}Google Gemini API{C_RESET} (Nube, alta velocidad)")
-    print(f"  {C_WHITE}[3]{C_RESET} {C_GRAY}Omitir por ahora{C_RESET} (Usar solo comandos tradicionales sin IA)")
-
-    try:
-        ai_choice = input(f"\n  {C_BOLD}Selecciona tu motor de IA [1/2/3] (Enter para 1): {C_RESET}").strip()
-    except (EOFError, KeyboardInterrupt):
-        ai_choice = "1"
-
-    ai_provider = "ollama"
-    if ai_choice == "2":
-        ai_provider = "gemini"
-        env_file = os.path.join(script_dir, ".env")
-        has_key = False
-        if os.path.isfile(env_file):
-            try:
-                with open(env_file, "r", encoding="utf-8") as ef:
-                    if "GEMINI_API_KEY=" in ef.read():
-                        has_key = True
-            except Exception:
-                pass
-
-        if not has_key:
-            try:
-                g_key = input(f"  Ingresa tu Google Gemini API Key (Enter para configurar luego): ").strip()
-                if g_key:
-                    with open(env_file, "a", encoding="utf-8") as ef:
-                        ef.write(f"\nGEMINI_API_KEY={g_key}\n")
-                    print(f"  {C_GREEN}[OK] API Key guardada de forma segura en .env (ignorado por Git).{C_RESET}")
-            except (EOFError, KeyboardInterrupt):
-                pass
-    elif ai_choice == "3":
-        ai_provider = "none"
-        print(f"  {C_GRAY}[*] Modo clinico clasico activado.{C_RESET}")
-    else:
-        ai_provider = "ollama"
-        if shutil.which("ollama"):
-            print(f"  {C_GREEN}[OK] Ollama detectado en tu sistema.{C_RESET}")
-        else:
-            print(f"  {C_YELLOW}[INFO] Ollama no detectado en PATH. Puedes instalarlo desde https://ollama.ai{C_RESET}")
+    print(f"{C_BOLD}[Paso 6/7] Motor de Inteligencia Artificial (GitDoctor AI){C_RESET}")
+    ai_cfg = configure_ai_provider(script_dir, {"ai_provider": "gemini"})
+    ai_provider = ai_cfg.get("ai_provider", "gemini")
 
     print("")
 
     # --------------------------------------------------------------------------
-    # PASO 6: MODO VIGILANTE EN SEGUNDO PLANO (WATCHDOG)
+    # PASO 7: MODO VIGILANTE EN SEGUNDO PLANO (WATCHDOG)
     # --------------------------------------------------------------------------
-    print(f"{C_BOLD}[Paso 6/6] Servicio Vigilante (Monitoreo en Segundo Plano){C_RESET}")
+    print(f"{C_BOLD}[Paso 7/7] Servicio Vigilante (Monitoreo en Segundo Plano){C_RESET}")
     print(f"  El Vigilante monitorea periodicamente tus ramas, commits pendientes y cambios")
     print(f"  locales para avisarte antes de apagar o cambiar de maquina.")
     watchdog_enabled = ask_user_confirmation("¿Deseas activar el modo Vigilante en este equipo?", default_yes=False)
@@ -720,6 +1254,11 @@ def run_full_setup(script_dir):
         "installed": True
     }
 
+    # Combinar parametros especificos del proveedor de IA
+    for k in ["ollama_model", "openai_model", "anthropic_model", "aws_region", "aws_bedrock_model"]:
+        if k in ai_cfg:
+            cfg_data[k] = ai_cfg[k]
+
     try:
         with open(cfg_file, "w", encoding="utf-8") as f:
             json.dump(cfg_data, f, indent=4, ensure_ascii=False)
@@ -740,6 +1279,29 @@ def run_full_setup(script_dir):
 
 def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # Modo verificacion de requisitos
+    if any(arg in sys.argv for arg in ["--ensure-prereqs", "--prereqs"]):
+        ensure_essential_tools()
+        return
+
+    # Modo configuracion directa de IA
+    if any(arg in sys.argv for arg in ["--config-ai", "--ai"]):
+        cfg_file = os.path.join(script_dir, "config.local.json")
+        cfg = {}
+        if os.path.isfile(cfg_file):
+            try:
+                cfg = json.load(open(cfg_file, "r", encoding="utf-8"))
+            except Exception:
+                pass
+        updated = configure_ai_provider(script_dir, cfg)
+        try:
+            with open(cfg_file, "w", encoding="utf-8") as f:
+                json.dump(updated, f, indent=4, ensure_ascii=False)
+            print(f"  {C_GREEN}[OK] Configuracion de IA actualizada en config.local.json.{C_RESET}\n")
+        except Exception as e:
+            print(f"  {C_RED}[ERROR] No se pudo guardar config.local.json: {e}{C_RESET}\n")
+        return
 
     # Modo instalador interactivo completo
     if any(arg in sys.argv for arg in ["--interactive-setup", "--setup", "-i"]):

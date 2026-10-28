@@ -29,6 +29,71 @@ if ! command -v python3 &>/dev/null; then
     exit 1
 fi
 
+# ------------------------------------------------------------------------------
+# Deteccion e instalacion de herramientas esenciales (Git CLI y GitHub CLI)
+# ------------------------------------------------------------------------------
+if [ "$REAJUSTE_MODE" = false ]; then
+    # 1. Comprobar Git CLI
+    if ! command -v git &>/dev/null; then
+        echo -e "${C_YELLOW}[!] Git CLI no esta instalado en este equipo.${C_RESET}"
+        if command -v brew &>/dev/null; then
+            echo -e "${C_CYAN}Instalando Git mediante Homebrew...${C_RESET}"
+            brew install git || true
+        else
+            echo -e "${C_CYAN}Invocando instalador de herramientas de linea de comandos de Apple...${C_RESET}"
+            xcode-select --install 2>/dev/null || true
+            echo -e "${C_YELLOW}Por favor completa la instalacion del cuadro de dialogo y vuelve a ejecutar setup-mac.sh.${C_RESET}"
+        fi
+    fi
+
+    # 2. Comprobar GitHub CLI ('gh')
+    if ! command -v gh &>/dev/null; then
+        echo -e "${C_YELLOW}[!] GitHub CLI ('gh') no esta instalado en este equipo.${C_RESET}"
+        echo -e "${C_GRAY}GitHub CLI es esencial para detectar tus organizaciones y clonar tus repositorios.${C_RESET}"
+        echo -e "${C_CYAN}Instalando GitHub CLI mediante curl nativo...${C_RESET}"
+
+        INSTALLED_GH=false
+        if command -v brew &>/dev/null; then
+            echo -e "${C_GRAY}Homebrew detectado. Ejecutando: brew install gh...${C_RESET}"
+            brew install gh && INSTALLED_GH=true || true
+        fi
+
+        if [ "$INSTALLED_GH" = false ] || ! command -v gh &>/dev/null; then
+            ARCH=$(uname -m)
+            GH_ARCH="macOS_amd64"
+            if [ "$ARCH" = "arm64" ] || [ "$ARCH" = "aarch64" ]; then
+                GH_ARCH="macOS_arm64"
+            fi
+
+            GH_TAG=$(curl -sSL -o /dev/null -w "%{url_effective}" https://github.com/cli/cli/releases/latest 2>/dev/null | sed 's#.*/v##' | tr -d '\r\n')
+            if [ -z "$GH_TAG" ]; then
+                GH_TAG="2.67.0"
+            fi
+
+            TMP_DIR=$(mktemp -d 2>/dev/null || echo "/tmp/gh_installer_$$")
+            mkdir -p "$TMP_DIR"
+            GH_URL="https://github.com/cli/cli/releases/download/v${GH_TAG}/gh_${GH_TAG}_${GH_ARCH}.zip"
+            echo -e "${C_GRAY}Descargando $GH_URL con curl nativo...${C_RESET}"
+            if curl -fsSL -o "$TMP_DIR/gh.zip" "$GH_URL"; then
+                unzip -q -o "$TMP_DIR/gh.zip" -d "$TMP_DIR"
+                EXTRACTED_GH=$(find "$TMP_DIR" -name "gh" -type f | head -n 1)
+                if [ -n "$EXTRACTED_GH" ]; then
+                    INSTALL_TARGET="/usr/local/bin"
+                    if [ ! -w "$INSTALL_TARGET" ]; then
+                        INSTALL_TARGET="$HOME/.local/bin"
+                        mkdir -p "$INSTALL_TARGET"
+                    fi
+                    cp "$EXTRACTED_GH" "$INSTALL_TARGET/gh"
+                    chmod +x "$INSTALL_TARGET/gh"
+                    export PATH="$INSTALL_TARGET:$PATH"
+                    echo -e "${C_GREEN}[OK] GitHub CLI ('gh') instalado exitosamente en $INSTALL_TARGET/gh.${C_RESET}"
+                fi
+            fi
+            rm -rf "$TMP_DIR" 2>/dev/null || true
+        fi
+    fi
+fi
+
 LOCAL_CFG="$SCRIPT_DIR/config.local.json"
 
 # En modo interactivo, ejecutar primero el asistente de configuracion completo
@@ -94,6 +159,10 @@ for legacy in "_sync" "repos-sync"; do
 done
 
 SHELL_BLOCK="# >>> GitDoctor Global Commands >>>
+if [ -d \"\$HOME/.local/bin\" ] && [[ \":\$PATH:\" != *\":\$HOME/.local/bin:\"* ]]; then
+    export PATH=\"\$HOME/.local/bin:\$PATH\"
+fi
+
 gitdoctor() {
     local target=\"\"
     for d in \"$SCRIPT_DIR\" \"\$HOME/Repos/gitdoctor\" \"\$HOME/repos/gitdoctor\"; do

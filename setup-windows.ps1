@@ -19,6 +19,70 @@ if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
     exit 1
 }
 
+# ------------------------------------------------------------------------------
+# Deteccion e instalacion de herramientas esenciales (Git CLI y GitHub CLI)
+# ------------------------------------------------------------------------------
+if (-not $Reajuste) {
+    # 1. Comprobar Git CLI
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+        Write-Host "[!] Git CLI no esta disponible en el sistema." -ForegroundColor Yellow
+        Write-Host "Intentando instalar Git con winget o curl nativo..." -ForegroundColor Cyan
+        $installedGit = $false
+        if (Get-Command winget -ErrorAction SilentlyContinue) {
+            try {
+                Write-Host "Instalando Git mediante winget..." -ForegroundColor Cyan
+                winget install --id Git.Git -e --source winget --accept-source-agreements --accept-package-agreements
+                $installedGit = $true
+            } catch {}
+        }
+        if (-not $installedGit -or (-not (Get-Command git -ErrorAction SilentlyContinue))) {
+            Write-Host "Descargando instalador de Git for Windows con curl nativo..." -ForegroundColor Cyan
+            $gitInstaller = Join-Path $env:TEMP "Git-Installer.exe"
+            try {
+                curl.exe -fSL -o $gitInstaller "https://github.com/git-for-windows/git/releases/latest/download/Git-64-bit.exe"
+                if (Test-Path $gitInstaller) {
+                    Write-Host "Ejecutando instalacion silenciosa de Git..." -ForegroundColor Cyan
+                    Start-Process -FilePath $gitInstaller -ArgumentList "/VERYSILENT /NORESTART /NOCANCEL /SP- /CLOSEAPPLICATIONS /RESTARTAPPLICATIONS" -Wait
+                    Remove-Item $gitInstaller -Force -ErrorAction SilentlyContinue
+                }
+            } catch {
+                Write-Host "[ADVERTENCIA] No se pudo descargar Git automaticamente: $_" -ForegroundColor Red
+            }
+        }
+        $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+    }
+
+    # 2. Comprobar GitHub CLI (gh)
+    if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
+        Write-Host "[!] GitHub CLI ('gh') no esta disponible en el sistema." -ForegroundColor Yellow
+        Write-Host "GitHub CLI es esencial para detectar tus organizaciones y clonar tus repositorios." -ForegroundColor Gray
+        Write-Host "Descargando e instalando GitHub CLI mediante winget o curl nativo..." -ForegroundColor Cyan
+        $installedGh = $false
+        if (Get-Command winget -ErrorAction SilentlyContinue) {
+            try {
+                Write-Host "Instalando GitHub CLI mediante winget..." -ForegroundColor Cyan
+                winget install --id GitHub.cli -e --source winget --accept-source-agreements --accept-package-agreements
+                $installedGh = $true
+            } catch {}
+        }
+        if (-not $installedGh -or (-not (Get-Command gh -ErrorAction SilentlyContinue))) {
+            Write-Host "Descargando GitHub CLI con curl nativo..." -ForegroundColor Cyan
+            $ghMsi = Join-Path $env:TEMP "gh_installer.msi"
+            try {
+                curl.exe -fSL -o $ghMsi "https://github.com/cli/cli/releases/latest/download/gh_windows_amd64.msi"
+                if (Test-Path $ghMsi) {
+                    Write-Host "Instalando paquete MSI de GitHub CLI..." -ForegroundColor Cyan
+                    Start-Process msiexec.exe -ArgumentList "/i `"$ghMsi`" /quiet /norestart" -Wait
+                    Remove-Item $ghMsi -Force -ErrorAction SilentlyContinue
+                }
+            } catch {
+                Write-Host "[ADVERTENCIA] No se pudo instalar GitHub CLI automaticamente: $_" -ForegroundColor Red
+            }
+        }
+        $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+    }
+}
+
 # En modo interactivo, ejecutar primero el asistente de configuracion completo
 if (-not $Reajuste) {
     python (Join-Path $scriptDir "onboarding.py") --interactive-setup
